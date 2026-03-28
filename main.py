@@ -7,7 +7,8 @@ app = Flask(__name__)
 def home():
     return "API is running ✅"
 
-@app.route('/get_video', methods=['GET'])def get_video():
+@app.route('/get_video', methods=['GET'])
+def get_video():
     video_url = request.args.get('url')
     if not video_url:
         return jsonify({"status": "error", "message": "No URL provided"}), 400
@@ -16,22 +17,23 @@ def home():
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            # مهم جداً عشان يوتيوب والمواقع التانية
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # تحليل بيانات الفيديو
             info = ydl.extract_info(video_url, download=False)
             
             formats_list = []
             
-            # استخراج الجودات المتاحة
+            # استخراج قائمة الجودات (Formats)
             if 'formats' in info:
                 for f in info['formats']:
-                    # بنختار بس الروابط اللي فيها فيديو وصوت مع بعض (أو روابط مباشرة)
+                    # نختار الروابط اللي فيها فيديو وصوت مع بعض (Direct Links)
                     if f.get('url') and (f.get('vcodec') != 'none' and f.get('acodec') != 'none'):
                         quality = f.get('format_note') or f.get('quality_label') or f"{f.get('height')}p"
-                        # تجنب تكرار الجودات
+                        
+                        # إضافة الجودة لو مش متكررة
                         if not any(item['quality'] == quality for item in formats_list):
                             formats_list.append({
                                 "quality": quality,
@@ -39,7 +41,7 @@ def home():
                                 "extension": f.get('ext', 'mp4')
                             })
 
-            # لو ملقاش جودات منظمة (زي بعض روابط فيسبوك)، بياخد أفضل رابط متاح
+            # لو ملقاش جودات مفصلة، ياخد أفضل رابط متاح
             if not formats_list:
                 download_url = info.get('url')
                 if not download_url and 'formats' in info:
@@ -57,11 +59,12 @@ def home():
             if not formats_list:
                 return jsonify({"status": "error", "message": "Could not find any downloadable formats."}), 404
 
+            # إرسال البيانات للتطبيق
             return jsonify({
                 "status": "success",
                 "title": info.get('title', 'No Title'),
                 "thumbnail": info.get('thumbnail', ''),
-                "formats": formats_list # دي القائمة اللي التطبيق مستنيها
+                "formats": formats_list
             })
 
     except Exception as e:
@@ -69,4 +72,3 @@ def home():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
