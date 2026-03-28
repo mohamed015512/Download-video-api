@@ -7,44 +7,61 @@ app = Flask(__name__)
 def home():
     return "API is running ✅"
 
-@app.route('/get_video', methods=['GET'])
-def get_video():
+@app.route('/get_video', methods=['GET'])def get_video():
     video_url = request.args.get('url')
     if not video_url:
         return jsonify({"status": "error", "message": "No URL provided"}), 400
 
     try:
         ydl_opts = {
-            'format': 'best',
             'quiet': True,
             'no_warnings': True,
+            # مهم جداً عشان يوتيوب والمواقع التانية
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(video_url, download=False)
-            except Exception as e:
-                return jsonify({"status": "error", "message": f"Could not extract video: {str(e)}"}), 400
+            info = ydl.extract_info(video_url, download=False)
+            
+            formats_list = []
+            
+            # استخراج الجودات المتاحة
+            if 'formats' in info:
+                for f in info['formats']:
+                    # بنختار بس الروابط اللي فيها فيديو وصوت مع بعض (أو روابط مباشرة)
+                    if f.get('url') and (f.get('vcodec') != 'none' and f.get('acodec') != 'none'):
+                        quality = f.get('format_note') or f.get('quality_label') or f"{f.get('height')}p"
+                        # تجنب تكرار الجودات
+                        if not any(item['quality'] == quality for item in formats_list):
+                            formats_list.append({
+                                "quality": quality,
+                                "url": f.get('url'),
+                                "extension": f.get('ext', 'mp4')
+                            })
 
-            if info is None:
-                return jsonify({"status": "error", "message": "Failed to get video info."}), 400
+            # لو ملقاش جودات منظمة (زي بعض روابط فيسبوك)، بياخد أفضل رابط متاح
+            if not formats_list:
+                download_url = info.get('url')
+                if not download_url and 'formats' in info:
+                    valid_f = [f for f in info['formats'] if f.get('url')]
+                    if valid_f:
+                        download_url = valid_f[-1]['url']
+                
+                if download_url:
+                    formats_list.append({
+                        "quality": "Best Quality",
+                        "url": download_url,
+                        "extension": info.get('ext', 'mp4')
+                    })
 
-            download_url = info.get('url')
-
-            if not download_url and 'formats' in info:
-                valid_formats = [f for f in info['formats'] if f.get('url')]
-                if valid_formats:
-                    download_url = valid_formats[-1]['url']
-
-            if not download_url:
-                return jsonify({"status": "error", "message": "Could not find a downloadable URL."}), 404
+            if not formats_list:
+                return jsonify({"status": "error", "message": "Could not find any downloadable formats."}), 404
 
             return jsonify({
                 "status": "success",
-                "download_url": download_url,
                 "title": info.get('title', 'No Title'),
-                "thumbnail": info.get('thumbnail', '')
+                "thumbnail": info.get('thumbnail', ''),
+                "formats": formats_list # دي القائمة اللي التطبيق مستنيها
             })
 
     except Exception as e:
@@ -52,3 +69,4 @@ def get_video():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
