@@ -1,21 +1,31 @@
 
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import yt_dlp
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend access
+
+# Enable CORS manually without flask_cors
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
 @app.route('/')
 def test():
     return "Server is running!"
 
-@app.route('/download', methods=['POST', 'GET'])
+@app.route('/download', methods=['POST', 'GET', 'OPTIONS'])
 def download():
+    # Handle OPTIONS request for CORS preflight
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     # Handle both POST and GET requests
     if request.method == 'POST':
         data = request.json
-        url = data.get("url")
+        url = data.get("url") if data else None
     else:  # GET
         url = request.args.get("url")
     
@@ -46,7 +56,7 @@ def download():
                 
                 quality = f"{f.get('height')}p"
                 
-                # Avoid duplicate qualities (keep first found)
+                # Avoid duplicate qualities
                 if quality not in seen_qualities:
                     seen_qualities.add(quality)
                     
@@ -56,8 +66,7 @@ def download():
                         "url": f.get("url"),
                         "filesize": f.get("filesize"),
                         "format_note": f.get("format_note", ""),
-                        "fps": f.get("fps"),
-                        "tbr": f.get("tbr")  # Total bitrate
+                        "fps": f.get("fps")
                     }
                     
                     # Remove None values
@@ -65,7 +74,8 @@ def download():
                     formats.append(format_info)
         
         # Sort by quality (highest first)
-        formats.sort(key=lambda x: int(x["quality"].replace("p", "")), reverse=True)
+        if formats:
+            formats.sort(key=lambda x: int(x["quality"].replace("p", "")), reverse=True)
         
         # Also provide best audio formats separately (optional)
         audio_formats = []
@@ -74,7 +84,7 @@ def download():
                 f.get("vcodec") == "none" and 
                 f.get("url")):
                 audio_formats.append({
-                    "quality": f.get("abr", "unknown") if f.get("abr") else f.get("format_note", "Audio"),
+                    "quality": str(f.get("abr", "unknown")) if f.get("abr") else f.get("format_note", "Audio"),
                     "ext": f.get("ext", "m4a"),
                     "url": f.get("url"),
                     "filesize": f.get("filesize")
@@ -82,7 +92,7 @@ def download():
         
         response_data = {
             "title": info.get("title"),
-            "thumbnail": info.get("thumbnail"),  # 👈 Added thumbnail
+            "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
             "channel": info.get("uploader"),
             "formats": formats,
@@ -94,10 +104,17 @@ def download():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/download/direct', methods=['POST'])
+@app.route('/download/direct', methods=['POST', 'OPTIONS'])
 def download_direct():
     """Alternative endpoint that downloads and streams the file"""
+    # Handle OPTIONS request for CORS preflight
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
     url = data.get("url")
     format_quality = data.get("quality")  # e.g., "720p"
     
@@ -105,28 +122,38 @@ def download_direct():
         return jsonify({"error": "No URL provided"}), 400
     
     try:
+        # Extract quality number
+        quality_num = format_quality.replace("p", "") if format_quality else "720"
+        
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'format': f'bestvideo[height<={format_quality.replace("p", "")}]+bestaudio/best[height<={format_quality.replace("p", "")}]',
+            'format': f'bestvideo[height<={quality_num}]+bestaudio/best[height<={quality_num}]',
             'noplaylist': True,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            url_info = ydl.process_ie_result(info, download=False)
             
             # Get the direct download URL
-            if 'url' in url_info:
-                download_url = url_info['url']
-            elif 'formats' in url_info and len(url_info['formats']) > 0:
-                download_url = url_info['formats'][0]['url']
-            else:
+            download_url = None
+            if 'url' in info:
+                download_url = info['url']
+            elif 'formats' in info and len(info['formats']) > 0:
+                # Find best format
+                for f in info['formats']:
+                    if f.get('height') and int(f.get('height', 0)) <= int(quality_num):
+                        download_url = f.get('url')
+                        break
+                if not download_url:
+                    download_url = info['formats'][0].get('url')
+            
+            if not download_url:
                 return jsonify({"error": "No downloadable URL found"}), 500
             
             return jsonify({
                 "title": info.get("title"),
-                "thumbnail": info.get("thumbnail"),  # 👈 Added thumbnail here too
+                "thumbnail": info.get("thumbnail"),
                 "download_url": download_url,
                 "quality": format_quality,
                 "ext": info.get("ext", "mp4")
@@ -136,4 +163,4 @@ def download_direct():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)
