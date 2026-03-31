@@ -5,6 +5,7 @@ from typing import Optional
 import yt_dlp
 import logging
 import os
+import re
 
 # إعداد السجلات
 logging.basicConfig(level=logging.INFO)
@@ -21,12 +22,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# إعدادات yt-dlp
+# إعدادات yt-dlp المحسنة لفيسبوك
 YDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'ignoreerrors': True,
     'extract_flat': False,
+    'cookiefile': None,  # يمكن إضافة ملف cookies إذا لزم الأمر
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
+}
+
+# إعدادات خاصة لفيسبوك
+FACEBOOK_OPTS = {
+    **YDL_OPTS,
+    'format': 'best[ext=mp4]/best',  # تفضيل صيغة mp4
 }
 
 @app.get("/")
@@ -52,10 +64,12 @@ def test_url(url: str = Query(..., description="رابط الفيديو")):
                 content={"status": "error", "message": "الرابط يجب أن يبدأ بـ http:// أو https://"}
             )
         
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        # اختيار الإعدادات المناسبة حسب نوع الرابط
+        opts = FACEBOOK_OPTS if 'facebook.com' in url or 'fb.watch' in url else YDL_OPTS
+        
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            # التحقق من أن info ليس None
             if info is None:
                 return JSONResponse(
                     status_code=400,
@@ -65,7 +79,9 @@ def test_url(url: str = Query(..., description="رابط الفيديو")):
             return {
                 "status": "success",
                 "platform": info.get("extractor_key", "unknown"),
-                "title": info.get("title", "بدون عنوان")[:100]
+                "title": info.get("title", "بدون عنوان")[:100],
+                "duration": info.get("duration", 0),
+                "message": "✓ الرابط صالح"
             }
             
     except yt_dlp.utils.DownloadError as e:
@@ -90,24 +106,30 @@ def get_video_info(url: str = Query(..., description="رابط الفيديو"))
         if not url.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="الرابط غير صحيح")
         
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        # اختيار الإعدادات المناسبة حسب نوع الرابط
+        opts = FACEBOOK_OPTS if 'facebook.com' in url or 'fb.watch' in url else YDL_OPTS
+        
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            # التحقق الأساسي: إذا كان info يساوي None
             if info is None:
-                raise HTTPException(status_code=404, detail="لم يتم العثور على الفيديو أو الرابط غير صالح")
+                raise HTTPException(status_code=404, detail="لم يتم العثور على الفيديو")
             
-            # استخراج المعلومات مع قيم افتراضية آمنة
-            title = info.get("title") if info.get("title") else "بدون عنوان"
-            duration = info.get("duration") if info.get("duration") else 0
-            thumbnail = info.get("thumbnail") if info.get("thumbnail") else ""
-            uploader = info.get("uploader") if info.get("uploader") else "غير معروف"
-            platform = info.get("extractor_key") if info.get("extractor_key") else "غير معروف"
+            # استخراج المعلومات مع قيم افتراضية
+            title = info.get("title") or "بدون عنوان"
+            duration = info.get("duration") or 0
+            thumbnail = info.get("thumbnail") or ""
+            uploader = info.get("uploader") or info.get("channel") or "غير معروف"
+            platform = info.get("extractor_key") or "unknown"
+            
+            # تنسيق المدة
+            duration_formatted = f"{duration // 60}:{duration % 60:02d}" if duration else "غير معروف"
             
             return {
                 "success": True,
                 "title": title,
                 "duration": duration,
+                "duration_formatted": duration_formatted,
                 "thumbnail": thumbnail,
                 "uploader": uploader,
                 "platform": platform,
@@ -115,7 +137,7 @@ def get_video_info(url: str = Query(..., description="رابط الفيديو"))
             
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"خطأ في yt-dlp: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"الرابط غير مدعوم: {str(e)[:100]}")
+        raise HTTPException(status_code=400, detail=f"فشل تحميل الفيديو: {str(e)[:100]}")
     except HTTPException:
         raise
     except Exception as e:
@@ -134,47 +156,61 @@ def get_download_url(
         if not url.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="الرابط غير صحيح")
         
-        opts = {**YDL_OPTS, 'format': quality}
+        # إعدادات خاصة حسب المنصة
+        if 'facebook.com' in url or 'fb.watch' in url:
+            opts = {**FACEBOOK_OPTS, 'format': 'best[ext=mp4]/best'}
+        else:
+            opts = {**YDL_OPTS, 'format': quality}
         
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            # التحقق الأساسي
             if info is None:
                 raise HTTPException(status_code=404, detail="لم يتم العثور على الفيديو")
             
-            # محاولة العثور على رابط التحميل
             download_url = None
+            selected_quality = quality
             
-            # الطريقة الأولى: رابط مباشر
+            # محاولة الحصول على الرابط
             if info.get("url"):
                 download_url = info.get("url")
             
-            # الطريقة الثانية: البحث في الصيغ
+            # البحث في الصيغ
             if not download_url and info.get("formats"):
+                # تصفية الصيغ المناسبة
+                video_formats = []
                 for f in info["formats"]:
                     if f and f.get("vcodec") != "none":
-                        download_url = f.get("url")
-                        if download_url:
-                            break
+                        video_formats.append(f)
+                
+                # ترتيب حسب الجودة
+                video_formats.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
+                
+                if video_formats:
+                    selected = video_formats[0]
+                    download_url = selected.get('url')
+                    if selected.get('height'):
+                        selected_quality = f"{selected['height']}p"
             
             if not download_url:
                 raise HTTPException(status_code=404, detail="تعذر استخراج رابط التحميل")
             
-            title = info.get("title") if info.get("title") else "video"
-            # تنظيف اسم الملف من الأحرف غير المسموحة
-            title = "".join(c for c in title if c.isalnum() or c in " -_").strip()
+            # تنظيف اسم الملف
+            title = info.get("title") or "facebook_video"
+            title = re.sub(r'[<>:"/\\|?*]', '', title)[:50]
             
             return {
                 "success": True,
                 "title": title,
                 "download_url": download_url,
-                "duration": info.get("duration", 0)
+                "quality": selected_quality,
+                "duration": info.get("duration", 0),
+                "platform": info.get("extractor_key", "facebook")
             }
             
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"خطأ في yt-dlp: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"الرابط غير مدعوم: {str(e)[:100]}")
+        raise HTTPException(status_code=400, detail=f"فشل التحميل: {str(e)[:100]}")
     except HTTPException:
         raise
     except Exception as e:
