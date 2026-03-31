@@ -1,5 +1,5 @@
 
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file
 import yt_dlp
 import os
 import re
@@ -8,13 +8,11 @@ import threading
 import time
 from datetime import datetime
 import requests
-from urllib.parse import urlparse
-import shutil
 
 app = Flask(__name__)
 
 # Configuration
-DOWNLOAD_FOLDER = "downloads"
+DOWNLOAD_FOLDER = "/tmp/downloads"  # Use /tmp for cloud platforms
 if not os.path.exists(DOWNLOAD_FOLDER):
     os.makedirs(DOWNLOAD_FOLDER)
 
@@ -38,10 +36,6 @@ def format_file_size(bytes):
             return f"{bytes:.1f} {unit}"
         bytes /= 1024
     return f"{bytes:.1f} GB"
-
-def sanitize_filename(filename):
-    """Remove invalid characters from filename"""
-    return re.sub(r'[<>:"/\\|?*]', '', filename)
 
 def download_video_task(download_id, url, quality, is_audio):
     """Background task to download video"""
@@ -70,24 +64,27 @@ def download_video_task(download_id, url, quality, is_audio):
             elif d['status'] == 'finished':
                 downloads_status[download_id]["progress"] = 100
         
-        # Configure yt-dlp
+        # Configure yt-dlp - بدون FFmpeg
+        filename_template = os.path.join(DOWNLOAD_FOLDER, f'{download_id}_%(title)s.%(ext)s')
+        
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'progress_hooks': [progress_hook],
-            'outtmpl': os.path.join(DOWNLOAD_FOLDER, f'{download_id}_%(title)s.%(ext)s'),
+            'outtmpl': filename_template,
             'noplaylist': True,
+            'restrictfilenames': True,
         }
         
         if is_audio:
+            # For audio, try to get best audio format
             ydl_opts['format'] = 'bestaudio/best'
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }]
         else:
-            ydl_opts['format'] = f'bestvideo[height<={quality_num}]+bestaudio/best[height<={quality_num}]'
+            # For video, get best quality available
+            if quality_num:
+                ydl_opts['format'] = f'bestvideo[height<={quality_num}]+bestaudio/best[height<={quality_num}]'
+            else:
+                ydl_opts['format'] = 'best[height<=720]'  # Default to 720p
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Extract info and download
@@ -95,16 +92,28 @@ def download_video_task(download_id, url, quality, is_audio):
             
             # Get downloaded file path
             filename = ydl.prepare_filename(info)
-            if is_audio:
-                filename = filename.replace('.webm', '.mp3').replace('.m4a', '.mp3')
+            
+            # Check if file exists
+            if os.path.exists(filename):
+                file_size = os.path.getsize(filename)
+            else:
+                # Try to find the file
+                for f in os.listdir(DOWNLOAD_FOLDER):
+                    if download_id in f:
+                        filename = os.path.join(DOWNLOAD_FOLDER, f)
+                        file_size = os.path.getsize(filename)
+                        break
+                else:
+                    filename = None
+                    file_size = 0
             
             downloads_status[download_id].update({
                 "status": "completed",
                 "progress": 100,
                 "title": info.get("title"),
-                "filename": os.path.basename(filename),
+                "filename": os.path.basename(filename) if filename else "unknown",
                 "filepath": filename,
-                "filesize": os.path.getsize(filename) if os.path.exists(filename) else 0
+                "filesize": file_size
             })
             
     except Exception as e:
@@ -267,12 +276,12 @@ def download_file(download_id):
         return jsonify({"error": "File not found"}), 404
     
     try:
-        # Send file and delete after sending (optional)
+        # Send file
         return send_file(
             filepath,
             as_attachment=True,
             download_name=filename,
-            mimetype='video/mp4' if not filename.endswith('.mp3') else 'audio/mpeg'
+            mimetype='video/mp4'
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -326,4 +335,4 @@ cleanup_thread = threading.Thread(target=cleanup_old_downloads, daemon=True)
 cleanup_thread.start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5000)
