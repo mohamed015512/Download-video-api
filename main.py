@@ -1,10 +1,27 @@
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file, send_from_directory
 import yt_dlp
+import os
+import re
+import uuid
+import threading
+import time
+from datetime import datetime
+import requests
+from urllib.parse import urlparse
+import shutil
 
 app = Flask(__name__)
 
-# Enable CORS manually without flask_cors
+# Configuration
+DOWNLOAD_FOLDER = "downloads"
+if not os.path.exists(DOWNLOAD_FOLDER):
+    os.makedirs(DOWNLOAD_FOLDER)
+
+# Store download progress
+downloads_status = {}
+
+# Enable CORS
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
@@ -12,34 +29,122 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
+def format_file_size(bytes):
+    """Convert bytes to human readable format"""
+    if not bytes:
+        return "Unknown"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes < 1024:
+            return f"{bytes:.1f} {unit}"
+        bytes /= 1024
+    return f"{bytes:.1f} GB"
+
+def sanitize_filename(filename):
+    """Remove invalid characters from filename"""
+    return re.sub(r'[<>:"/\\|?*]', '', filename)
+
+def download_video_task(download_id, url, quality, is_audio):
+    """Background task to download video"""
+    try:
+        downloads_status[download_id] = {
+            "status": "downloading",
+            "progress": 0,
+            "title": "",
+            "error": None
+        }
+        
+        quality_num = quality.replace("p", "") if quality and not is_audio else None
+        
+        # Define progress hook
+        def progress_hook(d):
+            if d['status'] == 'downloading':
+                if d.get('total_bytes'):
+                    percent = (d['downloaded_bytes'] / d['total_bytes']) * 100
+                elif d.get('total_bytes_estimate'):
+                    percent = (d['downloaded_bytes'] / d['total_bytes_estimate']) * 100
+                else:
+                    percent = 0
+                    
+                downloads_status[download_id]["progress"] = percent
+                
+            elif d['status'] == 'finished':
+                downloads_status[download_id]["progress"] = 100
+        
+        # Configure yt-dlp
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'progress_hooks': [progress_hook],
+            'outtmpl': os.path.join(DOWNLOAD_FOLDER, f'{download_id}_%(title)s.%(ext)s'),
+            'noplaylist': True,
+        }
+        
+        if is_audio:
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        else:
+            ydl_opts['format'] = f'bestvideo[height<={quality_num}]+bestaudio/best[height<={quality_num}]'
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Extract info and download
+            info = ydl.extract_info(url, download=True)
+            
+            # Get downloaded file path
+            filename = ydl.prepare_filename(info)
+            if is_audio:
+                filename = filename.replace('.webm', '.mp3').replace('.m4a', '.mp3')
+            
+            downloads_status[download_id].update({
+                "status": "completed",
+                "progress": 100,
+                "title": info.get("title"),
+                "filename": os.path.basename(filename),
+                "filepath": filename,
+                "filesize": os.path.getsize(filename) if os.path.exists(filename) else 0
+            })
+            
+    except Exception as e:
+        downloads_status[download_id] = {
+            "status": "error",
+            "error": str(e),
+            "progress": 0
+        }
+
 @app.route('/')
 def test():
-    return "Server is running!"
+    return jsonify({
+        "status": "running",
+        "message": "Video Downloader API is working!",
+        "version": "2.0"
+    })
 
-@app.route('/download', methods=['POST', 'GET', 'OPTIONS'])
-def download():
-    # Handle OPTIONS request for CORS preflight
+@app.route('/api/info', methods=['POST', 'GET', 'OPTIONS'])
+def get_info():
+    """Get video information and available formats"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
-    # Handle both POST and GET requests
+    url = None
     if request.method == 'POST':
         data = request.json
         url = data.get("url") if data else None
-    else:  # GET
+    else:
         url = request.args.get("url")
     
     if not url:
         return jsonify({"error": "No URL provided"}), 400
-
-    # Configure yt-dlp options
-    ydl_opts = {
-        'quiet': True,  # Suppress logs
-        'no_warnings': True,  # Suppress warnings
-        'extract_flat': False,  # Get full info
-    }
     
     try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         
@@ -48,7 +153,6 @@ def download():
         seen_qualities = set()
         
         for f in info.get("formats", []):
-            # Must have video (height), audio (acodec not none), and URL
             if (f.get("height") and 
                 f.get("url") and 
                 f.get("acodec") != "none" and
@@ -56,58 +160,56 @@ def download():
                 
                 quality = f"{f.get('height')}p"
                 
-                # Avoid duplicate qualities
                 if quality not in seen_qualities:
                     seen_qualities.add(quality)
                     
-                    format_info = {
+                    filesize = f.get("filesize") or f.get("filesize_approx", 0)
+                    
+                    formats.append({
                         "quality": quality,
                         "ext": f.get("ext", "mp4"),
-                        "url": f.get("url"),
-                        "filesize": f.get("filesize"),
-                        "format_note": f.get("format_note", ""),
-                        "fps": f.get("fps")
-                    }
-                    
-                    # Remove None values
-                    format_info = {k: v for k, v in format_info.items() if v is not None}
-                    formats.append(format_info)
+                        "filesize": filesize,
+                        "filesize_text": format_file_size(filesize) if filesize else "Unknown",
+                        "fps": f.get("fps"),
+                        "format_note": f.get("format_note", "")
+                    })
         
-        # Sort by quality (highest first)
-        if formats:
-            formats.sort(key=lambda x: int(x["quality"].replace("p", "")), reverse=True)
+        # Sort by quality
+        formats.sort(key=lambda x: int(x["quality"].replace("p", "")), reverse=True)
         
-        # Also provide best audio formats separately (optional)
+        # Audio formats
         audio_formats = []
         for f in info.get("formats", []):
             if (f.get("acodec") != "none" and 
                 f.get("vcodec") == "none" and 
                 f.get("url")):
+                
+                filesize = f.get("filesize") or f.get("filesize_approx", 0)
                 audio_formats.append({
-                    "quality": str(f.get("abr", "unknown")) if f.get("abr") else f.get("format_note", "Audio"),
+                    "quality": f"{f.get('abr', '128')}kbps" if f.get('abr') else "Audio",
                     "ext": f.get("ext", "m4a"),
-                    "url": f.get("url"),
-                    "filesize": f.get("filesize")
+                    "filesize": filesize,
+                    "filesize_text": format_file_size(filesize) if filesize else "Unknown"
                 })
         
-        response_data = {
+        return jsonify({
             "title": info.get("title"),
             "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
+            "duration_text": f"{info.get('duration', 0) // 60}:{info.get('duration', 0) % 60:02d}",
             "channel": info.get("uploader"),
+            "channel_url": info.get("uploader_url"),
+            "views": info.get("view_count"),
             "formats": formats,
             "audio_formats": audio_formats
-        }
-        
-        return jsonify(response_data)
+        })
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/download/direct', methods=['POST', 'OPTIONS'])
-def download_direct():
-    """Alternative endpoint that downloads and streams the file"""
-    # Handle OPTIONS request for CORS preflight
+@app.route('/api/download/start', methods=['POST', 'OPTIONS'])
+def start_download():
+    """Start download in background"""
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
@@ -116,51 +218,112 @@ def download_direct():
         return jsonify({"error": "No data provided"}), 400
     
     url = data.get("url")
-    format_quality = data.get("quality")  # e.g., "720p"
+    quality = data.get("quality", "720p")
+    is_audio = data.get("is_audio", False)
     
     if not url:
         return jsonify({"error": "No URL provided"}), 400
     
+    # Generate unique download ID
+    download_id = str(uuid.uuid4())
+    
+    # Start download in background thread
+    thread = threading.Thread(
+        target=download_video_task,
+        args=(download_id, url, quality, is_audio)
+    )
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({
+        "download_id": download_id,
+        "message": "Download started"
+    })
+
+@app.route('/api/download/status/<download_id>', methods=['GET'])
+def get_download_status(download_id):
+    """Get download progress"""
+    status = downloads_status.get(download_id)
+    if not status:
+        return jsonify({"error": "Download not found"}), 404
+    
+    return jsonify(status)
+
+@app.route('/api/download/file/<download_id>', methods=['GET'])
+def download_file(download_id):
+    """Download the actual file after completion"""
+    status = downloads_status.get(download_id)
+    
+    if not status:
+        return jsonify({"error": "Download not found"}), 404
+    
+    if status.get("status") != "completed":
+        return jsonify({"error": "Download not completed yet"}), 400
+    
+    filepath = status.get("filepath")
+    filename = status.get("filename")
+    
+    if not filepath or not os.path.exists(filepath):
+        return jsonify({"error": "File not found"}), 404
+    
     try:
-        # Extract quality number
-        quality_num = format_quality.replace("p", "") if format_quality else "720"
-        
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'format': f'bestvideo[height<={quality_num}]+bestaudio/best[height<={quality_num}]',
-            'noplaylist': True,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # Get the direct download URL
-            download_url = None
-            if 'url' in info:
-                download_url = info['url']
-            elif 'formats' in info and len(info['formats']) > 0:
-                # Find best format
-                for f in info['formats']:
-                    if f.get('height') and int(f.get('height', 0)) <= int(quality_num):
-                        download_url = f.get('url')
-                        break
-                if not download_url:
-                    download_url = info['formats'][0].get('url')
-            
-            if not download_url:
-                return jsonify({"error": "No downloadable URL found"}), 500
-            
-            return jsonify({
-                "title": info.get("title"),
-                "thumbnail": info.get("thumbnail"),
-                "download_url": download_url,
-                "quality": format_quality,
-                "ext": info.get("ext", "mp4")
-            })
-            
+        # Send file and delete after sending (optional)
+        return send_file(
+            filepath,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='video/mp4' if not filename.endswith('.mp3') else 'audio/mpeg'
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/download/cleanup/<download_id>', methods=['DELETE'])
+def cleanup_download(download_id):
+    """Delete downloaded file"""
+    status = downloads_status.get(download_id)
+    
+    if status and status.get("filepath"):
+        try:
+            if os.path.exists(status["filepath"]):
+                os.remove(status["filepath"])
+            downloads_status.pop(download_id, None)
+            return jsonify({"message": "Cleaned up successfully"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    return jsonify({"message": "Already cleaned up"})
+
+@app.route('/api/platforms', methods=['GET'])
+def get_supported_platforms():
+    """Return list of supported platforms"""
+    platforms = [
+        {"name": "YouTube", "icon": "youtube", "domains": ["youtube.com", "youtu.be"]},
+        {"name": "TikTok", "icon": "tiktok", "domains": ["tiktok.com"]},
+        {"name": "Facebook", "icon": "facebook", "domains": ["facebook.com", "fb.watch"]},
+        {"name": "Instagram", "icon": "instagram", "domains": ["instagram.com"]},
+        {"name": "Twitter", "icon": "twitter", "domains": ["twitter.com", "x.com"]},
+        {"name": "Vimeo", "icon": "vimeo", "domains": ["vimeo.com"]},
+    ]
+    return jsonify(platforms)
+
+# Cleanup old downloads every hour
+def cleanup_old_downloads():
+    """Remove files older than 1 hour"""
+    while True:
+        time.sleep(3600)  # Every hour
+        try:
+            for filename in os.listdir(DOWNLOAD_FOLDER):
+                filepath = os.path.join(DOWNLOAD_FOLDER, filename)
+                if os.path.isfile(filepath):
+                    # Remove files older than 1 hour
+                    if time.time() - os.path.getctime(filepath) > 3600:
+                        os.remove(filepath)
+        except:
+            pass
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_old_downloads, daemon=True)
+cleanup_thread.start()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
