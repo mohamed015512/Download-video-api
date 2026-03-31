@@ -25,52 +25,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# الإعدادات العامة لـ yt-dlp
+# الإعدادات العامة لـ yt-dlp مع إضافة مهلة زمنية
 YDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'ignoreerrors': True,
-    'format': 'best', # اختيار أفضل جودة مدمجة افتراضياً
+    'format': 'best',  # اختيار أفضل جودة مدمجة افتراضياً
+    'socket_timeout': 30,  # مهلة 30 ثانية
 }
 
 @app.get("/")
 def root():
     return {
         "message": "سيرفر تحميل الفيديوهات يعمل بنجاح ✅",
-        "endpoints": ["/info", "/download", "/health"]
+        "endpoints": ["/info", "/download", "/health"],
+        "status": "online"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "service": "video-downloader"}
 
 @app.get("/info")
 def get_video_info(url: str = Query(..., description="رابط الفيديو")):
     try:
         logger.info(f"طلب معلومات للرابط: {url}")
+        
+        # التحقق من صحة الرابط
+        if not url.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="الرابط غير صحيح")
+        
         with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise HTTPException(status_code=404, detail="تعذر العثور على الفيديو")
             
             return {
+                "success": True,
                 "title": info.get("title", "بدون عنوان"),
                 "duration": info.get("duration", 0),
                 "thumbnail": info.get("thumbnail", ""),
                 "uploader": info.get("uploader", "غير معروف"),
-                "platform": info.get("extractor_key", "غير معروف")
+                "platform": info.get("extractor_key", "غير معروف"),
+                "views": info.get("view_count", 0),
+                "like_count": info.get("like_count", 0)
             }
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"خطأ في التحميل من yt-dlp: {str(e)}")
+        raise HTTPException(status_code=400, detail="الرابط غير مدعوم أو غير صالح")
     except Exception as e:
         logger.error(f"خطأ في Info: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"حدث خطأ: {str(e)}")
 
 @app.get("/download")
 def get_download_url(
     url: str = Query(..., description="رابط الفيديو"),
-    quality: Optional[str] = Query("best", description="الجودة المطلوبة")
+    quality: Optional[str] = Query("best", description="الجودة المطلوبة (best, worst, bestvideo+bestaudio)")
 ):
     try:
         logger.info(f"طلب رابط تحميل: {url}")
+        
+        # التحقق من صحة الرابط
+        if not url.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="الرابط غير صحيح")
+        
         opts = {**YDL_OPTS, 'format': quality}
         
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -91,6 +109,12 @@ def get_download_url(
                 if valid_formats:
                     # اختيار آخر صيغة (غالباً تكون الأعلى جودة)
                     download_url = valid_formats[-1].get('url')
+                    
+                    # إضافة معلومات إضافية عن الجودة
+                    selected_format = valid_formats[-1]
+                    quality_info = selected_format.get('format_note', '')
+                    if not quality_info and selected_format.get('height'):
+                        quality_info = f"{selected_format['height']}p"
 
             if not download_url:
                 raise HTTPException(status_code=404, detail="تعذر استخراج رابط التحميل")
@@ -100,16 +124,39 @@ def get_download_url(
                 "title": info.get("title", "video"),
                 "download_url": download_url,
                 "extension": info.get("ext", "mp4"),
-                "duration": info.get("duration", 0)
+                "duration": info.get("duration", 0),
+                "quality": quality_info if 'quality_info' in locals() else quality,
+                "platform": info.get("extractor_key", "unknown")
             }
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"خطأ في yt-dlp: {str(e)}")
+        raise HTTPException(status_code=400, detail="الرابط غير مدعوم أو غير صالح")
     except Exception as e:
         logger.error(f"خطأ في Download: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"حدث خطأ: {str(e)}")
+
+@app.get("/test")
+def test_url(url: str = Query(..., description="رابط للاختبار")):
+    """نقطة اختبار سريعة للتحقق من صحة الرابط"""
+    try:
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                "status": "success",
+                "platform": info.get("extractor_key", "unknown"),
+                "title": info.get("title", "No title")[:100],
+                "message": "✓ الرابط صالح"
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"✗ الرابط غير صالح: {str(e)[:100]}"
+        }
 
 # تشغيل السيرفر - هذا الجزء هو الأهم لتجنب خطأ 127
 if __name__ == "__main__":
     import uvicorn
-    # السيرفر السحابي (مثل Cloud Run) يرسل رقم البورت في متغير بيئة يسمى PORT
+    # السيرفر السحابي (مثل Render) يرسل رقم البورت في متغير بيئة يسمى PORT
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"بدء تشغيل السيرفر على البورت: {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)س
