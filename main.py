@@ -4,168 +4,112 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import yt_dlp
 import logging
+import os
 
-# إعداد السجلات
+# إعداد السجلات (Logs) لمتابعة أي أخطاء على السيرفر
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# إنشاء تطبيق FastAPI
 app = FastAPI(
     title="Video Downloader API",
-    description="API لتحميل الفيديوهات من وسائل التواصل الاجتماعي",
+    description="API لخدمة مشروع تحميل الفيديوهات",
     version="1.0.0"
 )
 
-# إعداد CORS للسماح للتطبيق بالتواصل مع السيرفر
+# إعداد CORS للسماح لتطبيقك (Flutter/Web) بالوصول للسيرفر
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # في الإنتاج، حدد نطاق تطبيقك فقط
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# إعدادات yt-dlp
+# الإعدادات العامة لـ yt-dlp
 YDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'ignoreerrors': True,
+    'format': 'best', # اختيار أفضل جودة مدمجة افتراضياً
 }
 
 @app.get("/")
 def root():
-    """الصفحة الرئيسية للتحقق من عمل السيرفر"""
     return {
-        "message": "مرحباً بك في سيرفر تحميل الفيديوهات",
-        "status": "يعمل ✅",
-        "endpoints": [
-            "/health - للتحقق من صحة السيرفر",
-            "/info?url=URL - للحصول على معلومات الفيديو",
-            "/download?url=URL - للحصول على رابط التحميل"
-        ]
+        "message": "سيرفر تحميل الفيديوهات يعمل بنجاح ✅",
+        "endpoints": ["/info", "/download", "/health"]
     }
 
 @app.get("/health")
 def health_check():
-    """التحقق من صحة السيرفر"""
-    return {
-        "status": "healthy",
-        "message": "السيرفر يعمل بشكل جيد"
-    }
+    return {"status": "healthy"}
 
 @app.get("/info")
 def get_video_info(url: str = Query(..., description="رابط الفيديو")):
-    """
-    الحصول على معلومات الفيديو (العنوان، المدة، الصور المصغرة)
-    """
     try:
-        logger.info(f"جلب معلومات الفيديو: {url}")
-        
+        logger.info(f"طلب معلومات للرابط: {url}")
         with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             info = ydl.extract_info(url, download=False)
-            
             if not info:
-                raise HTTPException(status_code=404, detail="لم يتم العثور على الفيديو")
+                raise HTTPException(status_code=404, detail="تعذر العثور على الفيديو")
             
-            # استخراج المعلومات المطلوبة
-            result = {
+            return {
                 "title": info.get("title", "بدون عنوان"),
                 "duration": info.get("duration", 0),
                 "thumbnail": info.get("thumbnail", ""),
                 "uploader": info.get("uploader", "غير معروف"),
-                "views": info.get("view_count", 0),
-                "likes": info.get("like_count", 0),
-                "formats_count": len(info.get("formats", []))
+                "platform": info.get("extractor_key", "غير معروف")
             }
-            
-            return result
-            
     except Exception as e:
-        logger.error(f"خطأ في جلب المعلومات: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"حدث خطأ: {str(e)}")
+        logger.error(f"خطأ في Info: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/download")
 def get_download_url(
     url: str = Query(..., description="رابط الفيديو"),
-    quality: Optional[str] = Query("best[height<=720]", description="جودة الفيديو (مثال: best, worst, best[height<=480])")
+    quality: Optional[str] = Query("best", description="الجودة المطلوبة")
 ):
-    """
-    الحصول على رابط التحميل المباشر للفيديو
-    """
     try:
-        logger.info(f"جلب رابط التحميل: {url} بجودة {quality}")
-        
-        # إعدادات مخصصة للتحميل
-        opts = {
-            **YDL_OPTS,
-            'format': quality,
-        }
+        logger.info(f"طلب رابط تحميل: {url}")
+        opts = {**YDL_OPTS, 'format': quality}
         
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
             if not info:
-                raise HTTPException(status_code=404, detail="لم يتم العثور على الفيديو")
+                raise HTTPException(status_code=404, detail="الفيديو غير متاح")
+
+            # محاولة العثور على رابط مباشر (Direct URL)
+            download_url = info.get('url')
             
-            # محاولة الحصول على رابط التحميل المباشر
-            download_url = None
-            
-            # إذا كان format محدد
-            if 'url' in info:
-                download_url = info['url']
-            # البحث في formats
-            elif 'formats' in info and len(info['formats']) > 0:
-                # اختيار أفضل صيغة حسب الطلب
-                formats = info['formats']
+            # إذا لم يوجد رابط مباشر، نبحث في قائمة الصيغ (Formats)
+            if not download_url and 'formats' in info:
+                # تصفية الصيغ التي تحتوي على فيديو وصوت معاً لضمان التشغيل
+                valid_formats = [f for f in info['formats'] if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
+                if not valid_formats:
+                    valid_formats = [f for f in info['formats'] if f.get('vcodec') != 'none']
                 
-                # فلترة الصيغ التي تحتوي على فيديو
-                video_formats = [f for f in formats if f.get('vcodec') != 'none']
-                
-                if video_formats:
-                    # اختيار الأول أو حسب الجودة
-                    best_format = video_formats[0]
-                    download_url = best_format.get('url')
-            
+                if valid_formats:
+                    # اختيار آخر صيغة (غالباً تكون الأعلى جودة)
+                    download_url = valid_formats[-1].get('url')
+
             if not download_url:
-                raise HTTPException(status_code=404, detail="لم يتم العثور على رابط تحميل")
-            
+                raise HTTPException(status_code=404, detail="تعذر استخراج رابط التحميل")
+
             return {
                 "success": True,
-                "title": info.get("title", "فيديو"),
+                "title": info.get("title", "video"),
                 "download_url": download_url,
-                "quality": quality,
-                "duration": info.get("duration", 0),
-                "format": info.get("ext", "mp4")
-            }
-            
-    except Exception as e:
-        logger.error(f"خطأ في جلب رابط التحميل: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"حدث خطأ: {str(e)}")
-
-@app.get("/test")
-def test_url(url: str = Query(..., description="رابط للاختبار")):
-    """
-    نقطة اختبار بسيطة لفحص الروابط
-    """
-    try:
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            # محاولة استخراج المعلومات الأساسية فقط
-            info = ydl.extract_info(url, download=False)
-            
-            return {
-                "status": "success",
-                "platform": info.get("extractor_key", "غير معروف"),
-                "title": info.get("title", "بدون عنوان")[:100],
-                "duration": info.get("duration", 0),
-                "message": "✓ الرابط صالح ويمكن تحميله"
+                "extension": info.get("ext", "mp4"),
+                "duration": info.get("duration", 0)
             }
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"✗ الرابط غير صالح أو حدث خطأ: {str(e)[:100]}"
-        }
+        logger.error(f"خطأ في Download: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
-# تشغيل السيرفر محلياً (للتطوير فقط)
+# تشغيل السيرفر - هذا الجزء هو الأهم لتجنب خطأ 127
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    # السيرفر السحابي (مثل Cloud Run) يرسل رقم البورت في متغير بيئة يسمى PORT
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"بدء تشغيل السيرفر على البورت: {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
