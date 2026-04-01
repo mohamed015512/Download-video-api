@@ -1,225 +1,190 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from typing import Optional
+from pydantic import BaseModel, HttpUrl
+from typing import List, Optional, Dict, Any
 import yt_dlp
-import logging
-import os
-import re
+import asyncio
+import time
+from datetime import datetime
 
-# إعداد السجلات
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI(title="Video Downloader API", version="1.0.0")
 
-app = FastAPI(title="Video Downloader API")
-
-# إعداد CORS
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Production: specify your domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# إعدادات yt-dlp المحسنة لفيسبوك
-YDL_OPTS = {
-    'quiet': True,
-    'no_warnings': True,
-    'ignoreerrors': True,
-    'extract_flat': False,
-    'cookiefile': None,  # يمكن إضافة ملف cookies إذا لزم الأمر
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    }
-}
+# Rate limiting storage (simple version)
+rate_limit_storage: Dict[str, List[float]] = {}
 
-# إعدادات خاصة لفيسبوك
-FACEBOOK_OPTS = {
-    **YDL_OPTS,
-    'format': 'best[ext=mp4]/best',  # تفضيل صيغة mp4
-}
+# Models
+class VideoFormat(BaseModel):
+    quality: str
+    url: str
+    filesize: Optional[int] = None
+    extension: str
+    format_note: Optional[str] = None
 
-@app.get("/")
-def root():
-    return {
-        "message": "سيرفر تحميل الفيديوهات يعمل ✅",
-        "endpoints": ["/health", "/test", "/info", "/download"]
+class VideoInfo(BaseModel):
+    title: str
+    thumbnail: str
+    duration: int
+    formats: List[VideoFormat]
+    platform: str
+
+class ExtractRequest(BaseModel):
+    url: HttpUrl
+
+class ExtractResponse(BaseModel):
+    success: bool
+    data: Optional[VideoInfo] = None
+    error: Optional[str] = None
+
+# Rate limiting function
+def check_rate_limit(client_ip: str) -> bool:
+    current_time = time.time()
+    if client_ip not in rate_limit_storage:
+        rate_limit_storage[client_ip] = []
+    
+    # Clean old requests (older than 1 minute)
+    rate_limit_storage[client_ip] = [
+        timestamp for timestamp in rate_limit_storage[client_ip]
+        if current_time - timestamp < 60
+    ]
+    
+    # Max 5 requests per minute
+    if len(rate_limit_storage[client_ip]) >= 5:
+        return False
+    
+    rate_limit_storage[client_ip].append(current_time)
+    return True
+
+def extract_video_info(url: str) -> Dict[str, Any]:
+    """Extract video information using yt-dlp without downloading"""
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'force_json': True,
+        'no_color': True,
+        'ignoreerrors': True,
+        'format': 'bestvideo+bestaudio/best',
     }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            if not info:
+                raise HTTPException(status_code=400, detail="Failed to extract video info")
+            
+            # Filter formats
+            formats = []
+            seen_qualities = set()
+            
+            for f in info.get('formats', []):
+                # Check if format has both video and audio or is a combined format
+                has_video = f.get('vcodec') != 'none'
+                has_audio = f.get('acodec') != 'none'
+                height = f.get('height')
+                width = f.get('width')
+                format_note = f.get('format_note', '')
+                
+                # Only include formats with video and audio (or best available)
+                if (has_video and has_audio) or (has_video and not has_audio and height):
+                    quality = ''
+                    if height:
+                        quality = f"{height}p"
+                    elif format_note:
+                        quality = format_note
+                    else:
+                        quality = 'Unknown'
+                    
+                    # Avoid duplicates
+                    if quality not in seen_qualities:
+                        seen_qualities.add(quality)
+                        formats.append(VideoFormat(
+                            quality=quality,
+                            url=f.get('url', f.get('manifest_url', '')),
+                            filesize=f.get('filesize'),
+                            extension=f.get('ext', 'mp4'),
+                            format_note=format_note
+                        ))
+            
+            # Sort formats by quality
+            def quality_to_number(q: str) -> int:
+                try:
+                    return int(q.replace('p', ''))
+                except:
+                    return 0
+            
+            formats.sort(key=lambda x: quality_to_number(x.quality), reverse=True)
+            
+            # Determine platform
+            platform = 'unknown'
+            if 'youtube.com' in url or 'youtu.be' in url:
+                platform = 'youtube'
+            elif 'instagram.com' in url:
+                platform = 'instagram'
+            elif 'twitter.com' in url or 'x.com' in url:
+                platform = 'twitter'
+            elif 'tiktok.com' in url:
+                platform = 'tiktok'
+            
+            return {
+                'title': info.get('title', 'Unknown Title'),
+                'thumbnail': info.get('thumbnail', ''),
+                'duration': info.get('duration', 0),
+                'formats': [f.dict() for f in formats],
+                'platform': platform
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error extracting video: {str(e)}")
+
+@app.post("/extract", response_model=ExtractResponse)
+async def extract_video(request: ExtractRequest, background_tasks: BackgroundTasks):
+    """
+    Extract video information and direct download URLs
+    """
+    # Get client IP (for rate limiting)
+    # In production, get from request.client.host
+    client_ip = "default"
+    
+    # Rate limiting
+    if not check_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
+    
+    try:
+        # Extract video info
+        video_data = extract_video_info(str(request.url))
+        
+        return ExtractResponse(
+            success=True,
+            data=VideoInfo(**video_data)
+        )
+        
+    except HTTPException as e:
+        return ExtractResponse(
+            success=False,
+            error=e.detail
+        )
+    except Exception as e:
+        return ExtractResponse(
+            success=False,
+            error=f"Unexpected error: {str(e)}"
+        )
 
 @app.get("/health")
-def health_check():
-    return {"status": "healthy"}
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
-@app.get("/test")
-def test_url(url: str = Query(..., description="رابط الفيديو")):
-    """اختبار صلاحية الرابط"""
-    try:
-        logger.info(f"اختبار الرابط: {url}")
-        
-        if not url.startswith(('http://', 'https://')):
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "الرابط يجب أن يبدأ بـ http:// أو https://"}
-            )
-        
-        # اختيار الإعدادات المناسبة حسب نوع الرابط
-        opts = FACEBOOK_OPTS if 'facebook.com' in url or 'fb.watch' in url else YDL_OPTS
-        
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            if info is None:
-                return JSONResponse(
-                    status_code=400,
-                    content={"status": "error", "message": "لم يتم العثور على معلومات للفيديو"}
-                )
-            
-            return {
-                "status": "success",
-                "platform": info.get("extractor_key", "unknown"),
-                "title": info.get("title", "بدون عنوان")[:100],
-                "duration": info.get("duration", 0),
-                "message": "✓ الرابط صالح"
-            }
-            
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"خطأ في yt-dlp: {str(e)}")
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": f"الرابط غير مدعوم: {str(e)[:100]}"}
-        )
-    except Exception as e:
-        logger.error(f"خطأ غير متوقع: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"حدث خطأ: {str(e)[:100]}"}
-        )
-
-@app.get("/info")
-def get_video_info(url: str = Query(..., description="رابط الفيديو")):
-    """الحصول على معلومات الفيديو"""
-    try:
-        logger.info(f"جلب معلومات: {url}")
-        
-        if not url.startswith(('http://', 'https://')):
-            raise HTTPException(status_code=400, detail="الرابط غير صحيح")
-        
-        # اختيار الإعدادات المناسبة حسب نوع الرابط
-        opts = FACEBOOK_OPTS if 'facebook.com' in url or 'fb.watch' in url else YDL_OPTS
-        
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            if info is None:
-                raise HTTPException(status_code=404, detail="لم يتم العثور على الفيديو")
-            
-            # استخراج المعلومات مع قيم افتراضية
-            title = info.get("title") or "بدون عنوان"
-            duration = info.get("duration") or 0
-            thumbnail = info.get("thumbnail") or ""
-            uploader = info.get("uploader") or info.get("channel") or "غير معروف"
-            platform = info.get("extractor_key") or "unknown"
-            
-            # تنسيق المدة
-            duration_formatted = f"{duration // 60}:{duration % 60:02d}" if duration else "غير معروف"
-            
-            return {
-                "success": True,
-                "title": title,
-                "duration": duration,
-                "duration_formatted": duration_formatted,
-                "thumbnail": thumbnail,
-                "uploader": uploader,
-                "platform": platform,
-            }
-            
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"خطأ في yt-dlp: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"فشل تحميل الفيديو: {str(e)[:100]}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"خطأ في Info: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"حدث خطأ: {str(e)[:100]}")
-
-@app.get("/download")
-def get_download_url(
-    url: str = Query(..., description="رابط الفيديو"),
-    quality: Optional[str] = Query("best", description="الجودة المطلوبة")
-):
-    """الحصول على رابط التحميل المباشر"""
-    try:
-        logger.info(f"جلب رابط التحميل: {url}")
-        
-        if not url.startswith(('http://', 'https://')):
-            raise HTTPException(status_code=400, detail="الرابط غير صحيح")
-        
-        # إعدادات خاصة حسب المنصة
-        if 'facebook.com' in url or 'fb.watch' in url:
-            opts = {**FACEBOOK_OPTS, 'format': 'best[ext=mp4]/best'}
-        else:
-            opts = {**YDL_OPTS, 'format': quality}
-        
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            if info is None:
-                raise HTTPException(status_code=404, detail="لم يتم العثور على الفيديو")
-            
-            download_url = None
-            selected_quality = quality
-            
-            # محاولة الحصول على الرابط
-            if info.get("url"):
-                download_url = info.get("url")
-            
-            # البحث في الصيغ
-            if not download_url and info.get("formats"):
-                # تصفية الصيغ المناسبة
-                video_formats = []
-                for f in info["formats"]:
-                    if f and f.get("vcodec") != "none":
-                        video_formats.append(f)
-                
-                # ترتيب حسب الجودة
-                video_formats.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
-                
-                if video_formats:
-                    selected = video_formats[0]
-                    download_url = selected.get('url')
-                    if selected.get('height'):
-                        selected_quality = f"{selected['height']}p"
-            
-            if not download_url:
-                raise HTTPException(status_code=404, detail="تعذر استخراج رابط التحميل")
-            
-            # تنظيف اسم الملف
-            title = info.get("title") or "facebook_video"
-            title = re.sub(r'[<>:"/\\|?*]', '', title)[:50]
-            
-            return {
-                "success": True,
-                "title": title,
-                "download_url": download_url,
-                "quality": selected_quality,
-                "duration": info.get("duration", 0),
-                "platform": info.get("extractor_key", "facebook")
-            }
-            
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"خطأ في yt-dlp: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"فشل التحميل: {str(e)[:100]}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"خطأ في Download: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"حدث خطأ: {str(e)[:100]}")
-
-# تشغيل السيرفر
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"بدء تشغيل السيرفر على البورت: {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
