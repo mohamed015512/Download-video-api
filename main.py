@@ -1,14 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, HttpUrlfrom typing import List, Optional, Dict, Any
 import yt_dlp
 import time
 from datetime import datetime
 
-app = FastAPI(title="Video Downloader API", version="1.0.0")
+app = FastAPI(title="Professional Video Downloader API", version="1.1.0")
 
-# CORS configuration
+# إعدادات CORS للسماح لتطبيق الفلاتر بالاتصال
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,16 +16,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate limiting storage
+# تخزين بسيط لتحديد عدد الطلبات (Rate Limiting)
 rate_limit_storage: Dict[str, List[float]] = {}
 
-# Models
+# --- النماذج (Models) ---
+
 class VideoFormat(BaseModel):
     quality: str
     url: str
+    audio_url: Optional[str] = None  # رابط الصوت المنفصل للدمج
     filesize: Optional[int] = None
     extension: str
     format_note: Optional[str] = None
+    has_audio: bool = True
 
 class VideoInfo(BaseModel):
     title: str
@@ -43,181 +45,115 @@ class ExtractResponse(BaseModel):
     data: Optional[VideoInfo] = None
     error: Optional[str] = None
 
+# --- الوظائف المساعدة ---
+
 def check_rate_limit(client_ip: str) -> bool:
     current_time = time.time()
     if client_ip not in rate_limit_storage:
         rate_limit_storage[client_ip] = []
     
+    # تنظيف الطلبات القديمة (أقدم من دقيقة)
     rate_limit_storage[client_ip] = [
-        timestamp for timestamp in rate_limit_storage[client_ip]
-        if current_time - timestamp < 60
+        t for t in rate_limit_storage[client_ip] if current_time - t < 60
     ]
     
-    if len(rate_limit_storage[client_ip]) >= 5:
+    if len(rate_limit_storage[client_ip]) >= 10: # حد أقصى 10 طلبات في الدقيقة
         return False
     
     rate_limit_storage[client_ip].append(current_time)
     return True
 
 def extract_video_info(url: str) -> Dict[str, Any]:
-    """Extract video information using yt-dlp without downloading"""
+    """استخراج معلومات الفيديو والروابط باستخدام yt-dlp"""
     
-    # ✅ تحسين إعدادات yt-dlp للحصول على فيديو مع صوت
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
-        'force_json': True,
-        'no_color': True,
-        'ignoreerrors': True,
-        # ✅ إعدادات للحصول على فيديو مع صوت
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'merge_output_format': 'mp4',
-        'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }],
-        'geo_bypass': True,
-        'socket_timeout': 30,
+        'skip_download': True,
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
             if not info:
-                raise HTTPException(status_code=400, detail="Failed to extract video info")
+                raise Exception("Could not fetch info")
+
+            all_formats = info.get('formats', [])
             
-            # ✅ تحسين فلترة الفورمات - اختيار الفورمات التي تحتوي على فيديو وصوت
-            formats = []
+            # 1. البحث عن أفضل رابط صوت متاح (لعملية الدمج في التطبيق)
+            best_audio = None
+            audio_only_formats = [f for f in all_formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
+            if audio_only_formats:
+                # نختار أفضل جودة صوت (غالباً m4a لسهولة الدمج)
+                best_audio = max(audio_only_formats, key=lambda x: x.get('abr', 0) or 0)
+            
+            formats_to_return = []
             seen_qualities = set()
-            
-            # محاولة الحصول على الفورمات المدمجة (video+audio)
-            for f in info.get('formats', []):
-                has_video = f.get('vcodec') != 'none'
-                has_audio = f.get('acodec') != 'none'
-                height = f.get('height')
-                format_note = f.get('format_note', '')
+
+            # 2. تصفية ومعالجة روابط الفيديو
+            for f in all_formats:
+                vcodec = f.get('vcodec', 'none')
+                acodec = f.get('acodec', 'none')
                 
-                # ✅ الأفضلية للفورمات التي تحتوي على فيديو وصوت معاً
-                if has_video and has_audio:
-                    quality = ''
-                    if height:
-                        quality = f"{height}p"
-                    elif format_note:
-                        quality = format_note
-                    else:
-                        quality = 'Unknown'
+                if vcodec != 'none': # إذا كان يحتوي على فيديو
+                    height = f.get('height')
+                    if not height: continue
                     
-                    if quality not in seen_qualities:
+                    quality = f"{height}p"
+                    has_audio = (acodec != 'none' and acodec is not None)
+                    
+                    # نرسل رابط الصوت إذا كان الفيديو صامتاً (مثل فيديوهات فيسبوك HD)
+                    audio_url = None if has_audio else (best_audio['url'] if best_audio else None)
+
+                    # تجنب تكرار نفس الجودة (نأخذ الأفضل)
+                    if quality not in seen_qualities or has_audio:
                         seen_qualities.add(quality)
-                        formats.append({
+                        formats_to_return.append({
                             'quality': quality,
-                            'url': f.get('url', f.get('manifest_url', '')),
+                            'url': f.get('url'),
+                            'audio_url': audio_url,
                             'filesize': f.get('filesize'),
                             'extension': f.get('ext', 'mp4'),
-                            'format_note': format_note
+                            'format_note': f.get('format_note', ''),
+                            'has_audio': has_audio or (audio_url is not None)
                         })
-            
-            # ✅ إذا لم نجد فورمات مدمجة، نستخدم أفضل فورمات فيديو + أفضل فورمات صوت
-            if not formats:
-                # البحث عن أفضل فورمات فيديو
-                video_formats = [f for f in info.get('formats', []) if f.get('vcodec') != 'none']
-                audio_formats = [f for f in info.get('formats', []) if f.get('acodec') != 'none']
-                
-                if video_formats and audio_formats:
-                    # اختيار أفضل فورمات فيديو
-                    best_video = max(video_formats, key=lambda x: x.get('height', 0) or 0)
-                    best_audio = max(audio_formats, key=lambda x: x.get('abr', 0) or 0)
-                    
-                    height = best_video.get('height')
-                    quality = f"{height}p" if height else "Best"
-                    
-                    formats.append({
-                        'quality': quality,
-                        'url': best_video.get('url', ''),
-                        'filesize': best_video.get('filesize'),
-                        'extension': 'mp4',
-                        'format_note': 'Video only (audio will be downloaded separately in app)'
-                    })
-            
-            # Sort formats by quality
-            def quality_to_number(q: str) -> int:
-                try:
-                    return int(q.replace('p', ''))
-                except:
-                    return 0
-            
-            formats.sort(key=lambda x: quality_to_number(x['quality']), reverse=True)
-            
-            # Determine platform
-            platform = 'unknown'
-            if 'youtube.com' in url or 'youtu.be' in url:
-                platform = 'youtube'
-            elif 'instagram.com' in url:
-                platform = 'instagram'
-            elif 'twitter.com' in url or 'x.com' in url:
-                platform = 'twitter'
-            elif 'tiktok.com' in url:
-                platform = 'tiktok'
-            
-            duration = info.get('duration', 0)
-            if duration is None:
-                duration = 0
-            
+
+            # ترتيب الجودات من الأعلى للأقل
+            formats_to_return.sort(key=lambda x: int(x['quality'].replace('p','')) if 'p' in x['quality'] else 0, reverse=True)
+
             return {
-                'title': info.get('title', 'Unknown Title'),
+                'title': info.get('title', 'Video'),
                 'thumbnail': info.get('thumbnail', ''),
-                'duration': float(duration),
-                'formats': formats,
-                'platform': platform
+                'duration': float(info.get('duration', 0) or 0),
+                'formats': formats_to_return,
+                'platform': info.get('extractor_key', 'unknown').lower()
             }
             
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error extracting video: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- المسارات (Endpoints) ---
 
 @app.post("/extract", response_model=ExtractResponse)
-async def extract_video(request: ExtractRequest):
-    """Extract video information and direct download URLs"""
-    client_ip = "default"
+async def extract(request: Request, req_body: ExtractRequest):
+    client_ip = request.client.host
     if not check_rate_limit(client_ip):
-        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
-    
-    try:
-        video_data = extract_video_info(str(request.url))
-        
-        return ExtractResponse(
-            success=True,
-            data=VideoInfo(**video_data)
-        )
-        
-    except HTTPException as e:
-        return ExtractResponse(
-            success=False,
-            error=e.detail
-        )
-    except Exception as e:
-        return ExtractResponse(
-            success=False,
-            error=f"Unexpected error: {str(e)}"
-        )
+        return ExtractResponse(success=False, error="Rate limit exceeded. Please wait.")
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Video Downloader API",
-        "version": "1.0.0",
-        "status": "running"
-    }
+    try:
+        data = extract_video_info(str(req_body.url))
+        return ExtractResponse(success=True, data=VideoInfo(**data))
+    except Exception as e:
+        return ExtractResponse(success=False, error=str(e))
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    }
+async def health():
+    return {"status": "healthy", "time": datetime.now().isoformat()}
+
+@app.get("/")
+async def index():
+    return {"message": "API is running. Use /extract to get video info."}
 
 if __name__ == "__main__":
     import uvicorn
