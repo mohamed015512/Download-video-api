@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrlfrom typing import List, Optional, Dict, Any
+from pydantic import BaseModel, HttpUrl
+from typing import List, Optional, Dict, Any
 import yt_dlp
 import time
 from datetime import datetime
@@ -98,14 +99,17 @@ def extract_video_info(url: str) -> Dict[str, Any]:
                 
                 if vcodec != 'none': # إذا كان يحتوي على فيديو
                     height = f.get('height')
-                    if not height: continue
+                    if not height: 
+                        continue
                     
                     quality = f"{height}p"
                     has_audio = (acodec != 'none' and acodec is not None)
                     
-                    # نرسل رابط الصوت إذا كان الفيديو صامتاً (مثل فيديوهات فيسبوك HD)
-                    audio_url = None if has_audio else (best_audio['url'] if best_audio else None)
-
+                    # نرسل رابط الصوت إذا كان الفيديو صامتاً (مثل فيديوهات HD)
+                    audio_url = None 
+                    if not has_audio and best_audio:
+                        audio_url = best_audio.get('url')
+                    
                     # تجنب تكرار نفس الجودة (نأخذ الأفضل)
                     if quality not in seen_qualities or has_audio:
                         seen_qualities.add(quality)
@@ -120,14 +124,30 @@ def extract_video_info(url: str) -> Dict[str, Any]:
                         })
 
             # ترتيب الجودات من الأعلى للأقل
-            formats_to_return.sort(key=lambda x: int(x['quality'].replace('p','')) if 'p' in x['quality'] else 0, reverse=True)
+            formats_to_return.sort(
+                key=lambda x: int(x['quality'].replace('p', '')) if 'p' in x['quality'] else 0, 
+                reverse=True
+            )
+            
+            # تحديد المنصة
+            platform = info.get('extractor_key', 'unknown').lower()
+            if 'youtube' in platform:
+                platform = 'youtube'
+            elif 'facebook' in platform:
+                platform = 'facebook'
+            elif 'instagram' in platform:
+                platform = 'instagram'
+            elif 'twitter' in platform or 'x' in platform:
+                platform = 'twitter'
+            elif 'tiktok' in platform:
+                platform = 'tiktok'
 
             return {
                 'title': info.get('title', 'Video'),
                 'thumbnail': info.get('thumbnail', ''),
                 'duration': float(info.get('duration', 0) or 0),
                 'formats': formats_to_return,
-                'platform': info.get('extractor_key', 'unknown').lower()
+                'platform': platform
             }
             
     except Exception as e:
@@ -144,16 +164,25 @@ async def extract(request: Request, req_body: ExtractRequest):
     try:
         data = extract_video_info(str(req_body.url))
         return ExtractResponse(success=True, data=VideoInfo(**data))
+    except HTTPException as e:
+        return ExtractResponse(success=False, error=e.detail)
     except Exception as e:
         return ExtractResponse(success=False, error=str(e))
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "time": datetime.now().isoformat()}
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/")
 async def index():
-    return {"message": "API is running. Use /extract to get video info."}
+    return {
+        "message": "Professional Video Downloader API is running",
+        "version": "1.1.0",
+        "endpoints": {
+            "/extract": "POST - Extract video info and download URLs",
+            "/health": "GET - Check API health"
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
