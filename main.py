@@ -20,7 +20,7 @@ app.add_middleware(
 # Rate limiting storage
 rate_limit_storage: Dict[str, List[float]] = {}
 
-# Models - تم تعديل duration ليقبل float
+# Models
 class VideoFormat(BaseModel):
     quality: str
     url: str
@@ -31,7 +31,7 @@ class VideoFormat(BaseModel):
 class VideoInfo(BaseModel):
     title: str
     thumbnail: str
-    duration: float  # ✅ تغيير من int إلى float
+    duration: float
     formats: List[VideoFormat]
     platform: str
 
@@ -43,19 +43,16 @@ class ExtractResponse(BaseModel):
     data: Optional[VideoInfo] = None
     error: Optional[str] = None
 
-# Rate limiting function
 def check_rate_limit(client_ip: str) -> bool:
     current_time = time.time()
     if client_ip not in rate_limit_storage:
         rate_limit_storage[client_ip] = []
     
-    # Clean old requests (older than 1 minute)
     rate_limit_storage[client_ip] = [
         timestamp for timestamp in rate_limit_storage[client_ip]
         if current_time - timestamp < 60
     ]
     
-    # Max 5 requests per minute
     if len(rate_limit_storage[client_ip]) >= 5:
         return False
     
@@ -65,6 +62,7 @@ def check_rate_limit(client_ip: str) -> bool:
 def extract_video_info(url: str) -> Dict[str, Any]:
     """Extract video information using yt-dlp without downloading"""
     
+    # ✅ تحسين إعدادات yt-dlp للحصول على فيديو مع صوت
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -72,7 +70,15 @@ def extract_video_info(url: str) -> Dict[str, Any]:
         'force_json': True,
         'no_color': True,
         'ignoreerrors': True,
-        'format': 'bestvideo+bestaudio/best',
+        # ✅ إعدادات للحصول على فيديو مع صوت
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'merge_output_format': 'mp4',
+        'postprocessors': [{
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4',
+        }],
+        'geo_bypass': True,
+        'socket_timeout': 30,
     }
     
     try:
@@ -82,18 +88,19 @@ def extract_video_info(url: str) -> Dict[str, Any]:
             if not info:
                 raise HTTPException(status_code=400, detail="Failed to extract video info")
             
-            # Filter formats
+            # ✅ تحسين فلترة الفورمات - اختيار الفورمات التي تحتوي على فيديو وصوت
             formats = []
             seen_qualities = set()
             
+            # محاولة الحصول على الفورمات المدمجة (video+audio)
             for f in info.get('formats', []):
-                # Check if format has video
                 has_video = f.get('vcodec') != 'none'
+                has_audio = f.get('acodec') != 'none'
                 height = f.get('height')
                 format_note = f.get('format_note', '')
                 
-                # Only include formats with video
-                if has_video:
+                # ✅ الأفضلية للفورمات التي تحتوي على فيديو وصوت معاً
+                if has_video and has_audio:
                     quality = ''
                     if height:
                         quality = f"{height}p"
@@ -102,7 +109,6 @@ def extract_video_info(url: str) -> Dict[str, Any]:
                     else:
                         quality = 'Unknown'
                     
-                    # Avoid duplicates
                     if quality not in seen_qualities:
                         seen_qualities.add(quality)
                         formats.append({
@@ -112,6 +118,28 @@ def extract_video_info(url: str) -> Dict[str, Any]:
                             'extension': f.get('ext', 'mp4'),
                             'format_note': format_note
                         })
+            
+            # ✅ إذا لم نجد فورمات مدمجة، نستخدم أفضل فورمات فيديو + أفضل فورمات صوت
+            if not formats:
+                # البحث عن أفضل فورمات فيديو
+                video_formats = [f for f in info.get('formats', []) if f.get('vcodec') != 'none']
+                audio_formats = [f for f in info.get('formats', []) if f.get('acodec') != 'none']
+                
+                if video_formats and audio_formats:
+                    # اختيار أفضل فورمات فيديو
+                    best_video = max(video_formats, key=lambda x: x.get('height', 0) or 0)
+                    best_audio = max(audio_formats, key=lambda x: x.get('abr', 0) or 0)
+                    
+                    height = best_video.get('height')
+                    quality = f"{height}p" if height else "Best"
+                    
+                    formats.append({
+                        'quality': quality,
+                        'url': best_video.get('url', ''),
+                        'filesize': best_video.get('filesize'),
+                        'extension': 'mp4',
+                        'format_note': 'Video only (audio will be downloaded separately in app)'
+                    })
             
             # Sort formats by quality
             def quality_to_number(q: str) -> int:
@@ -133,7 +161,6 @@ def extract_video_info(url: str) -> Dict[str, Any]:
             elif 'tiktok.com' in url:
                 platform = 'tiktok'
             
-            # ✅ duration now supports float values
             duration = info.get('duration', 0)
             if duration is None:
                 duration = 0
@@ -141,7 +168,7 @@ def extract_video_info(url: str) -> Dict[str, Any]:
             return {
                 'title': info.get('title', 'Unknown Title'),
                 'thumbnail': info.get('thumbnail', ''),
-                'duration': float(duration),  # ✅ تحويل إلى float
+                'duration': float(duration),
                 'formats': formats,
                 'platform': platform
             }
@@ -151,16 +178,12 @@ def extract_video_info(url: str) -> Dict[str, Any]:
 
 @app.post("/extract", response_model=ExtractResponse)
 async def extract_video(request: ExtractRequest):
-    """
-    Extract video information and direct download URLs
-    """
-    # Rate limiting
+    """Extract video information and direct download URLs"""
     client_ip = "default"
     if not check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute.")
     
     try:
-        # Extract video info
         video_data = extract_video_info(str(request.url))
         
         return ExtractResponse(
