@@ -16,7 +16,7 @@ import shutil
 app = FastAPI(
     title="CupGet Video Downloader API - Professional Edition",
     version="3.0.0",
-    description="يدعم جميع صيغ الفيديو والمواقع مع كشف DRM"
+    description="يدعم جميع صيغ الفيديو والمواقع مع كشف DRM - الوحش 🦖"
 )
 
 # إعدادات CORS
@@ -124,7 +124,7 @@ def check_rate_limit(client_ip: str) -> bool:
         rate_limit_storage[client_ip] = []
     
     rate_limit_storage[client_ip] = [
-        t for t inrate_limit_storage[client_ip] if current_time - t < 60
+        t for t in rate_limit_storage[client_ip] if current_time - t < 60
     ]
     
     if len(rate_limit_storage[client_ip]) >= 10:
@@ -266,7 +266,29 @@ def extract_video_info_generic(url: str) -> Dict[str, Any]:
         'prefer_insecure': False,
         'socket_timeout': 30,
         'retries': 5,
-        'extract_flat': 'in_playlist',
+        # --- الإضافات السحرية (الوحش) ---
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'referer': 'https://www.google.com/',
+        'http_headers': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        },
+        # السماح لـ yt-dlp باستخدام الـ Generic Extractor بشكل أقوى
+        'force_generic_extractor': False,
+        'extractor_args': {
+            'generic': {
+                'fragment_retries': [10],
+                'skip_download': [False],
+            }
+        }
     }
     
     try:
@@ -504,7 +526,7 @@ async def health():
 @app.get("/")
 async def index():
     return {
-        "message": "CupGet Video Downloader API - Professional Edition",
+        "message": "CupGet Video Downloader API - Professional Edition 🦖",
         "version": "3.0.0",
         "developer": "Professional Video Downloader",
         "supported_formats_count": len(ALL_VIDEO_EXTENSIONS),
@@ -517,7 +539,8 @@ async def index():
             "✅ دعم الروابط العامة والمواقع الإخبارية",
             "✅ كشف الحماية DRM مع رسائل مناسبة",
             "✅ خيارات HD و SD لكل الفيديوهات",
-            "✅ نظام حماية من الطلبات المتكررة (Rate Limiting)"
+            "✅ نظام حماية من الطلبات المتكررة (Rate Limiting)",
+            "✅伪装 متقدم (User-Agent, Referer, Headers) لتجاوز الحماية 🦖"
         ],
         "endpoints": {
             "/extract": "POST - استخراج معلومات الفيديو وروابط التحميل",
@@ -534,15 +557,16 @@ if __name__ == "__main__":
     print(f"""
     ╔══════════════════════════════════════════════════════════════╗
     ║     CupGet Video Downloader API - Professional Edition      ║
-    ║                         Version 3.0.0                        ║
+    ║                      Version 3.0.0 🦖                        ║
     ╠══════════════════════════════════════════════════════════════╣
     ║  🎬 Supported Direct Formats: {len(ALL_VIDEO_EXTENSIONS)} formats      ║
     ║  📡 Streaming Support: HLS (.m3u8) + DASH (.mpd)            ║
     ║  🛡️ DRM Detection: Enabled                                   ║
-    ║  🌐 Platform Support: 1000+ sites via yt-dlp                ║
+    ║  🌐 Platform Support: 1000+ sites via yt-dlp                 ║
+    ║  🦖 Stealth Mode: User-Agent + Referer + Headers             ║
     ╠══════════════════════════════════════════════════════════════╣
-    ║  🚀 Server running on: http://0.0.0.0:8000                  ║
-    ║  📖 API Docs: http://0.0.0.0:8000/docs                      ║
+    ║  🚀 Server running on: http://0.0.0.0:8000                   ║
+    ║  📖 API Docs: http://0.0.0.0:8000/docs                       ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
