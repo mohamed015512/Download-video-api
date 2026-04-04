@@ -6,7 +6,7 @@ import yt_dlp
 import time
 from datetime import datetime
 
-app = FastAPI(title="Professional Video Downloader API", version="1.1.0")
+app = FastAPI(title="Professional Video Downloader API", version="1.2.0")
 
 # إعدادات CORS للسماح لتطبيق الفلاتر بالاتصال
 app.add_middleware(
@@ -22,21 +22,23 @@ rate_limit_storage: Dict[str, List[float]] = {}
 
 # --- النماذج (Models) ---
 
-class VideoFormat(BaseModel):
+class DownloadOption(BaseModel):
     quality: str
     url: str
-    audio_url: Optional[str] = None  # رابط الصوت المنفصل للدمج
     filesize: Optional[int] = None
-    extension: str
+    filesize_mb: float = 0
+    extension: str = "mp4"
+    height: int = 0
+    bitrate: Optional[float] = None
     format_note: Optional[str] = None
-    has_audio: bool = True
 
 class VideoInfo(BaseModel):
     title: str
     thumbnail: str
     duration: float
-    formats: List[VideoFormat]
     platform: str
+    download_options: Dict[str, Optional[DownloadOption]]
+    all_formats_count: int = 0
 
 class ExtractRequest(BaseModel):
     url: HttpUrl
@@ -82,59 +84,71 @@ def extract_video_info(url: str) -> Dict[str, Any]:
 
             all_formats = info.get('formats', [])
             
-            # 1. البحث عن أفضل رابط صوت متاح (لعملية الدمج في التطبيق)
-            best_audio = None
-            audio_only_formats = [f for f in all_formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
-            if audio_only_formats:
-                # نختار أفضل جودة صوت (غالباً m4a لسهولة الدمج)
-                best_audio = max(audio_only_formats, key=lambda x: x.get('abr', 0) or 0)
+            # تصنيف الجودات إلى HD و SD
+            hd_formats = []  # جودة عالية (720p فأعلى)
+            sd_formats = []  # جودة موفرة (أقل من 720p)
             
-            formats_to_return = []
-            seen_qualities = set()
-
-            # 2. تصفية ومعالجة روابط الفيديو
             for f in all_formats:
                 vcodec = f.get('vcodec', 'none')
-                acodec = f.get('acodec', 'none')
+                if vcodec == 'none':
+                    continue
+                    
+                height = f.get('height') or 0
+                filesize = f.get('filesize') or f.get('filesize_approx') or 0
                 
-                if vcodec != 'none': # إذا كان يحتوي على فيديو
-                    height = f.get('height')
-                    if not height: 
-                        continue
-                    
-                    quality = f"{height}p"
-                    has_audio = (acodec != 'none' and acodec is not None)
-                    
-                    # نرسل رابط الصوت إذا كان الفيديو صامتاً (مثل فيديوهات HD)
-                    audio_url = None 
-                    if not has_audio and best_audio:
-                        audio_url = best_audio.get('url')
-                    
-                    # تجنب تكرار نفس الجودة (نأخذ الأفضل)
-                    if quality not in seen_qualities or has_audio:
-                        seen_qualities.add(quality)
-                        formats_to_return.append({
-                            'quality': quality,
-                            'url': f.get('url'),
-                            'audio_url': audio_url,
-                            'filesize': f.get('filesize'),
-                            'extension': f.get('ext', 'mp4'),
-                            'format_note': f.get('format_note', ''),
-                            'has_audio': has_audio or (audio_url is not None)
-                        })
-
-            # ترتيب الجودات من الأعلى للأقل
-            formats_to_return.sort(
-                key=lambda x: int(x['quality'].replace('p', '')) if 'p' in x['quality'] else 0, 
-                reverse=True
-            )
+                format_info = {
+                    'quality': f"{height}p" if height > 0 else 'Unknown',
+                    'url': f.get('url'),
+                    'filesize': filesize,
+                    'filesize_mb': round(filesize / (1024 * 1024), 2) if filesize else 0,
+                    'extension': f.get('ext', 'mp4'),
+                    'height': height,
+                    'bitrate': f.get('tbr', 0),
+                    'format_note': f.get('format_note', '')
+                }
+                
+                if height >= 720:  # HD
+                    hd_formats.append(format_info)
+                elif height > 0:   # SD
+                    sd_formats.append(format_info)
+            
+            # ترتيب الجودات تنازلياً
+            hd_formats.sort(key=lambda x: x['height'], reverse=True)
+            sd_formats.sort(key=lambda x: x['height'], reverse=True)
+            
+            # اختيار أفضل جودة HD وأفضل جودة SD
+            best_hd = hd_formats[0] if hd_formats else None
+            best_sd = sd_formats[0] if sd_formats else None
             
             # تحديد المنصة
             platform = info.get('extractor_key', 'unknown').lower()
             if 'youtube' in platform:
                 platform = 'youtube'
+                # ليوتيوب، نضمن وجود جودة منخفضة أيضاً
+                if best_hd and not best_sd:
+                    # البحث عن جودة 360p أو 480p
+                    for f in all_formats:
+                        height = f.get('height') or 0
+                        if 360 <= height < 720:
+                            best_sd = {
+                                'quality': f"{height}p",
+                                'url': f.get('url'),
+                                'filesize': f.get('filesize') or 0,
+                                'filesize_mb': round((f.get('filesize') or 0) / (1024 * 1024), 2),
+                                'extension': f.get('ext', 'mp4'),
+                                'height': height,
+                                'bitrate': f.get('tbr', 0),
+                                'format_note': f.get('format_note', '')
+                            }
+                            break
+                            
             elif 'facebook' in platform:
                 platform = 'facebook'
+                # فيسبوك غالباً عنده عدة جودات
+                if not best_sd and hd_formats and len(hd_formats) > 1:
+                    # نأخذ أقل جودة HD كبديل SD
+                    best_sd = hd_formats[-1]
+                    
             elif 'instagram' in platform:
                 platform = 'instagram'
             elif 'twitter' in platform or 'x' in platform:
@@ -142,12 +156,27 @@ def extract_video_info(url: str) -> Dict[str, Any]:
             elif 'tiktok' in platform:
                 platform = 'tiktok'
 
+            # تجهيز خيارات التحميل
+            download_options = {
+                'hd': best_hd,
+                'sd': best_sd
+            }
+            
+            # تنظيف البيانات
+            clean_options = {}
+            for key, option in download_options.items():
+                if option:
+                    clean_options[key] = DownloadOption(**option)
+                else:
+                    clean_options[key] = None
+
             return {
                 'title': info.get('title', 'Video'),
                 'thumbnail': info.get('thumbnail', ''),
                 'duration': float(info.get('duration', 0) or 0),
-                'formats': formats_to_return,
-                'platform': platform
+                'platform': platform,
+                'download_options': clean_options,
+                'all_formats_count': len(all_formats)
             }
             
     except Exception as e:
@@ -159,7 +188,7 @@ def extract_video_info(url: str) -> Dict[str, Any]:
 async def extract(request: Request, req_body: ExtractRequest):
     client_ip = request.client.host
     if not check_rate_limit(client_ip):
-        return ExtractResponse(success=False, error="Rate limit exceeded. Please wait.")
+        return ExtractResponse(success=False, error="Rate limit exceeded. Please wait. Maximum 10 requests per minute.")
 
     try:
         data = extract_video_info(str(req_body.url))
@@ -177,10 +206,15 @@ async def health():
 async def index():
     return {
         "message": "Professional Video Downloader API is running",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "endpoints": {
-            "/extract": "POST - Extract video info and download URLs",
+            "/extract": "POST - Extract video info and download URLs (returns HD and SD options)",
             "/health": "GET - Check API health"
+        },
+        "features": {
+            "quality_selection": "Returns both HD (720p+) and SD (<720p) options when available",
+            "platforms_supported": ["youtube", "facebook", "instagram", "twitter", "tiktok"],
+            "rate_limit": "10 requests per minute per IP"
         }
     }
 
