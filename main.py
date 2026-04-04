@@ -12,10 +12,11 @@ import subprocess
 import os
 import tempfile
 import shutil
+import random
 
 app = FastAPI(
     title="CupGet Video Downloader API - Professional Edition",
-    version="3.0.0",
+    version="3.1.0",
     description="يدعم جميع صيغ الفيديو والمواقع مع كشف DRM"
 )
 
@@ -31,58 +32,55 @@ app.add_middleware(
 # تخزين مؤقت للطلبات
 rate_limit_storage: Dict[str, List[float]] = {}
 
-# --- قوائم الصيغ المدعومة ---
+# ============ قائمة User-Agents حقيقية لمتصفحات مختلفة ============
+USER_AGENTS = [
+    # Chrome على Windows
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+    
+    # Chrome على macOS
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    
+    # Firefox
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/121.0',
+    
+    # Safari
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    
+    # Edge
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+]
 
+# ============ قائمة Accept Headers ============
+ACCEPT_HEADERS = [
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+]
+
+def get_random_user_agent() -> str:
+    """إرجاع User-Agent عشوائي لتجنب الحظر"""
+    return random.choice(USER_AGENTS)
+
+def get_random_accept_header() -> str:
+    """إرجاع Accept Header عشوائي"""
+    return random.choice(ACCEPT_HEADERS)
+
+# --- قوائم الصيغ المدعومة ---
 ALL_VIDEO_EXTENSIONS = [
-    # صيغ شائعة
     '.mp4', '.mov', '.mkv', '.webm', '.avi', '.flv', '.wmv',
-    
-    # صيغ Apple / QuickTime
-    '.m4v', '.mp4v', '.mpv', '.qt',
-    
-    # صيغ HD / Blu-ray
-    '.m2ts', '.mts', '.ts', '.m2v', '.mpeg', '.mpg', '.vob',
-    
-    # صيغ متخصصة
-    '.3gp', '.3g2',           # الهواتف المحمولة
-    '.asf',                   # Windows Media
-    '.divx',                  # DivX
-    '.f4v', '.f4p', '.f4a', '.f4b',  # Adobe Flash
-    '.gifv',                  # GIF متحرك عالي الجودة
-    '.mxf',                   # Material Exchange Format
-    '.ogv', '.ogg',           # Ogg Video
-    '.rm', '.rmvb',           # RealMedia
-    '.roq',                   # Id Software
-    '.swf',                   # Shockwave Flash
-    '.vivo',                  # VivoActive
-    '.wm',                    # Windows Media
-    '.yuv',                   # Raw YUV
-    
-    # صيغ متقدمة
-    '.avchd',                 # AVCHD
-    '.bik',                   # Bink Video
-    '.cxi',                   # CineForm
-    '.drc',                   # Dirac
-    '.dv',                    # Digital Video
-    '.hevc', '.h265',         # HEVC/H.265
-    '.ivf',                   # IVF
-    '.mjpeg', '.mjpg',        # MJPEG
-    '.mk3d',                  # Matroska 3D
-    '.nsv',                   # Nullsoft Streaming Video
-    '.ogm',                   # Ogg Media
-    '.rec',                   # Topfield PVR
-    '.thp',                   # THP
-    '.vid',                   # Generic Video
-    '.viv',                   # VivoActive
-    '.vp8', '.vp9',           # VP8/VP9
-    '.av1',                   # AV1
+    '.m4v', '.mp4v', '.mpv', '.qt', '.m2ts', '.mts', '.ts',
+    '.m2v', '.mpeg', '.mpg', '.vob', '.3gp', '.3g2', '.asf',
+    '.divx', '.f4v', '.gifv', '.mxf', '.ogv', '.ogg', '.rm',
+    '.rmvb', '.swf', '.wm', '.yuv', '.hevc', '.h265', '.av1',
 ]
 
 HLS_EXTENSIONS = ['.m3u8', '.m3u']
 DASH_EXTENSIONS = ['.mpd']
 
 # --- النماذج (Models) ---
-
 class DownloadOption(BaseModel):
     quality: str
     url: str
@@ -93,8 +91,8 @@ class DownloadOption(BaseModel):
     bitrate: Optional[float] = None
     format_note: Optional[str] = None
     is_direct: bool = False
-    is_streaming: bool = False  # HLS أو DASH
-    streaming_type: Optional[str] = None  # 'hls' أو 'dash'
+    is_streaming: bool = False
+    streaming_type: Optional[str] = None
 
 class VideoInfo(BaseModel):
     title: str
@@ -107,6 +105,7 @@ class VideoInfo(BaseModel):
     all_formats_count: int = 0
     is_streaming: bool = False
     streaming_warning: Optional[str] = None
+    extracted_url: Optional[str] = None  # الرابط بعد فك التوجيه
 
 class ExtractRequest(BaseModel):
     url: HttpUrl
@@ -117,14 +116,13 @@ class ExtractResponse(BaseModel):
     error: Optional[str] = None
 
 # --- الوظائف المساعدة ---
-
 def check_rate_limit(client_ip: str) -> bool:
     current_time = time.time()
     if client_ip not in rate_limit_storage:
         rate_limit_storage[client_ip] = []
     
     rate_limit_storage[client_ip] = [
-        t for t inrate_limit_storage[client_ip] if current_time - t < 60
+        t for t in rate_limit_storage[client_ip] if current_time - t < 60
     ]
     
     if len(rate_limit_storage[client_ip]) >= 10:
@@ -133,130 +131,40 @@ def check_rate_limit(client_ip: str) -> bool:
     rate_limit_storage[client_ip].append(current_time)
     return True
 
-def is_streaming_url(url: str) -> Optional[Dict[str, Any]]:
-    """التحقق من روابط البث المباشر HLS و DASH"""
-    url_lower = url.lower()
-    
-    for ext in HLS_EXTENSIONS:
-        if ext in url_lower:
-            return {
-                'type': 'hls',
-                'url': url,
-                'warning': 'هذا الرابط من نوع HLS (بث متقطع). قد يحتاج إلى دمج المقاطع بعد التحميل.'
-            }
-    
-    for ext in DASH_EXTENSIONS:
-        if ext in url_lower:
-            return {
-                'type': 'dash',
-                'url': url,
-                'warning': 'هذا الرابط من نوع DASH (بث متكيف). قد يحتاج إلى معالجة خاصة.'
-            }
-    
-    return None
-
-def is_direct_video_url(url: str) -> Optional[Dict[str, Any]]:
-    """التحقق من الروابط المباشرة لجميع صيغ الفيديو"""
-    url_lower = url.lower()
-    parsed = urllib.parse.urlparse(url)
-    path = parsed.path
-    
-    for ext in ALL_VIDEO_EXTENSIONS:
-        # التحقق من نهاية الرابط
-        if url_lower.endswith(ext):
-            return _create_direct_response(url, ext, path)
+def extract_final_url(url: str) -> str:
+    """محاولة فك توجيه الرابط والحصول على الرابط النهائي"""
+    try:
+        import requests
+        # استخدام User-Agent حقيقي لفك التوجيه
+        headers = {
+            'User-Agent': get_random_user_agent(),
+            'Accept': get_random_accept_header(),
+            'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
         
-        # التحقق من وجود معلمات استعلام
-        if f'{ext}?' in url_lower or f'{ext}&' in url_lower:
-            return _create_direct_response(url, ext, path)
+        response = requests.head(url, headers=headers, allow_redirects=True, timeout=10)
+        final_url = response.url
         
-        # التحقق من وجود الامتداد في المسار
-        if path.lower().endswith(ext):
-            return _create_direct_response(url, ext, path)
-    
-    return None
-
-def _create_direct_response(url: str, extension: str, path: str) -> Dict[str, Any]:
-    """إنشاء استجابة للرابط المباشر"""
-    filename = path.split('/')[-1].split('?')[0]
-    ext_clean = extension.replace('.', '')
-    
-    # محاولة استخراج اسم أفضل
-    title = filename.replace(extension, '').replace('_', ' ').replace('-', ' ')
-    title = title.replace('%20', ' ').replace('+', ' ').strip()
-    
-    if not title or len(title) < 2:
-        title = f"فيديو مباشر {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    
-    return {
-        'title': title.title(),
-        'thumbnail': '',
-        'duration': 0,
-        'platform': 'direct',
-        'download_options': {
-            'hd': {
-                'quality': f'Direct Video ({ext_clean.upper()})',
-                'url': url,
-                'filesize': None,
-                'filesize_mb': 0,
-                'extension': ext_clean,
-                'height': 0,
-                'bitrate': None,
-                'format_note': 'رابط فيديو مباشر - تحميل فوري',
-                'is_direct': True,
-                'is_streaming': False,
-                'streaming_type': None
-            },
-            'sd': None
-        },
-        'is_drm_protected': False,
-        'all_formats_count': 1,
-        'is_streaming': False,
-        'streaming_warning': None
-    }
-
-def handle_streaming_url(url: str, stream_info: Dict[str, Any]) -> Dict[str, Any]:
-    """معالجة روابط البث المباشر HLS/DASH"""
-    return {
-        'title': f'بث مباشر ({stream_info["type"].upper()})',
-        'thumbnail': '',
-        'duration': 0,
-        'platform': 'streaming',
-        'download_options': {
-            'hd': {
-                'quality': f'Streaming ({stream_info["type"].upper()})',
-                'url': url,
-                'filesize': None,
-                'filesize_mb': 0,
-                'extension': stream_info['type'],
-                'height': 0,
-                'bitrate': None,
-                'format_note': stream_info['warning'],
-                'is_direct': False,
-                'is_streaming': True,
-                'streaming_type': stream_info['type']
-            },
-            'sd': None
-        },
-        'is_drm_protected': False,
-        'all_formats_count': 1,
-        'is_streaming': True,
-        'streaming_warning': stream_info['warning']
-    }
-
-def check_for_drm(error_message: str) -> bool:
-    """التحقق من وجود DRM في رسائل الخطأ"""
-    drm_keywords = [
-        'drm', 'encrypted', 'license', 'widevine', 'playready',
-        'fairplay', 'clearkey', 'cannot download', 'protected content',
-        'decryption', 'encryption', 'no decrypt', 'DRM', '许可证'
-    ]
-    error_lower = error_message.lower()
-    return any(keyword in error_lower for keyword in drm_keywords)
+        # إذا لم ينجح HEAD، جرب GET
+        if final_url == url:
+            response = requests.get(url, headers=headers, allow_redirects=True, timeout=10, stream=True)
+            final_url = response.url
+            response.close()
+        
+        return final_url
+    except Exception:
+        return url
 
 def extract_video_info_generic(url: str) -> Dict[str, Any]:
     """استخراج معلومات الفيديو باستخدام yt-dlp مع دعم جميع المواقع"""
     
+    # محاولة فك توجيه الرابط أولاً
+    final_url = extract_final_url(url)
+    
+    # إعدادات yt-dlp المتقدمة لمحاكاة المتصفح
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -265,41 +173,70 @@ def extract_video_info_generic(url: str) -> Dict[str, Any]:
         'no_check_certificate': True,
         'prefer_insecure': False,
         'socket_timeout': 30,
-        'retries': 5,
-        'extract_flat': 'in_playlist',
+        'retries': 10,
+        'fragment_retries': 10,
+        
+        # 🔥 الأهم: محاكاة المتصفح الحقيقي
+        'user_agent': get_random_user_agent(),
+        'headers': {
+            'Accept': get_random_accept_header(),
+            'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8,fr;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        },
+        
+        # تمكين المعالج العام للمواقع
+        'force_generic_extractor': False,  # False = استخدام extractors مخصصة أولاً
+        
+        # إعدادات إضافية للروابط القصيرة
+        'default_search': 'auto',
+        'source_address': '0.0.0.0',
+        
+        # محاولة استخراج حتى لو بدا الموقع غير مدعوم
+        'ignore_no_formats_error': True,
+        
+        # تمكين استخراج المعلومات الأساسية من HTML
+        'extractor_args': {
+            'generic': {
+                'fragment': ['--no-playlist'],
+                'no_playlist': ['--no-playlist'],
+            }
+        },
+        
+        # وقت إضافي للمواقع البطيئة
+        'sleep_interval': 1,
+        'max_sleep_interval': 3,
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            # محاولة استخراج المعلومات
+            info = ydl.extract_info(final_url, download=False)
             
             if not info:
                 raise Exception("Could not fetch video information")
             
-            # التحقق من وجود DRM
-            if info.get('_error') and check_for_drm(str(info.get('_error'))):
-                return _create_drm_response(info)
-            
             # التحقق من قوائم التشغيل
             if 'entries' in info and info['entries']:
-                # نأخذ أول فيديو من قائمة التشغيل
                 first_video = info['entries'][0]
                 if first_video:
                     info = first_video
             
-            all_formats = info.get('formats', [])
+            # إذا لم نجد رابط فيديو، جرب طريقة بديلة
+            if not info.get('url') and not info.get('formats'):
+                # محاولة مع force_generic_extractor = True
+                ydl_opts['force_generic_extractor'] = True
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                    info = ydl2.extract_info(final_url, download=False)
             
-            # البحث عن روابط مباشرة في البيانات إذا لم توجد صيغ
-            if not all_formats:
-                if info.get('url'):
-                    all_formats = [{
-                        'url': info.get('url'),
-                        'vcodec': 'avc1',
-                        'height': 720,
-                        'ext': info.get('ext', 'mp4')
-                    }]
-                elif info.get('requested_downloads'):
-                    all_formats = info.get('requested_downloads')
+            all_formats = info.get('formats', [])
             
             # تصنيف الجودات
             hd_formats = []
@@ -308,28 +245,16 @@ def extract_video_info_generic(url: str) -> Dict[str, Any]:
             for f in all_formats:
                 vcodec = f.get('vcodec', 'none')
                 if vcodec == 'none' and f.get('acodec') != 'none':
-                    # هذا صوت فقط، نتخطى
                     continue
                 
                 height = f.get('height') or 0
                 filesize = f.get('filesize') or f.get('filesize_approx') or 0
-                
-                # تحديد الامتداد
                 ext = f.get('ext', 'mp4')
-                if ext not in ['mp4', 'mkv', 'webm', 'avi', 'mov']:
-                    ext = 'mp4'  # افتراضي
                 
-                # التحقق مما إذا كانت صيغة البث
-                is_streaming = False
-                streaming_type = None
+                # التحقق من صحة الرابط
                 url_value = f.get('url', '')
-                
-                if '.m3u8' in url_value.lower():
-                    is_streaming = True
-                    streaming_type = 'hls'
-                elif '.mpd' in url_value.lower():
-                    is_streaming = True
-                    streaming_type = 'dash'
+                if not url_value:
+                    continue
                 
                 format_info = {
                     'quality': f"{height}p" if height > 0 else 'Auto',
@@ -340,9 +265,9 @@ def extract_video_info_generic(url: str) -> Dict[str, Any]:
                     'height': height,
                     'bitrate': f.get('tbr', 0),
                     'format_note': f.get('format_note', ''),
-                    'is_direct': not is_streaming,
-                    'is_streaming': is_streaming,
-                    'streaming_type': streaming_type
+                    'is_direct': True,
+                    'is_streaming': False,
+                    'streaming_type': None
                 }
                 
                 if height >= 720 or (height == 0 and 'best' in str(f.get('format_note', '')).lower()):
@@ -378,8 +303,8 @@ def extract_video_info_generic(url: str) -> Dict[str, Any]:
             platform_map = {
                 'youtube': 'youtube', 'facebook': 'facebook', 'instagram': 'instagram',
                 'twitter': 'twitter', 'tiktok': 'tiktok', 'vimeo': 'vimeo',
-                'dailymotion': 'dailymotion', 'twitch': 'twitch', 
-                'generic': 'web', 'genericmedia': 'web'
+                'dailymotion': 'dailymotion', 'twitch': 'twitch', 'reddit': 'reddit',
+                'generic': 'web', 'genericmedia': 'web', 'generichttp': 'web'
             }
             platform = platform_map.get(platform, 'web')
             
@@ -391,13 +316,6 @@ def extract_video_info_generic(url: str) -> Dict[str, Any]:
                 else:
                     clean_options[key] = None
             
-            # تحذير للبث المباشر
-            streaming_warning = None
-            is_streaming = False
-            if best_hd and best_hd.get('is_streaming'):
-                is_streaming = True
-                streaming_warning = 'هذا الفيديو من نوع البث المتقطع (HLS/DASH). قد لا يعمل التحميل المباشر على جميع الأجهزة.'
-            
             return {
                 'title': info.get('title', 'Video'),
                 'thumbnail': info.get('thumbnail', ''),
@@ -407,32 +325,16 @@ def extract_video_info_generic(url: str) -> Dict[str, Any]:
                 'is_drm_protected': False,
                 'drm_message': None,
                 'all_formats_count': len(all_formats),
-                'is_streaming': is_streaming,
-                'streaming_warning': streaming_warning
+                'is_streaming': False,
+                'streaming_warning': None,
+                'extracted_url': final_url
             }
             
     except Exception as e:
         error_msg = str(e)
-        if check_for_drm(error_msg):
-            raise HTTPException(status_code=403, detail="DRM_PROTECTED")
         raise HTTPException(status_code=400, detail=error_msg)
 
-def _create_drm_response(info: Dict[str, Any]) -> Dict[str, Any]:
-    """إنشاء استجابة للفيديو المحمي بـ DRM"""
-    return {
-        'title': info.get('title', 'Video'),
-        'thumbnail': info.get('thumbnail', ''),
-        'duration': float(info.get('duration', 0) or 0),
-        'platform': info.get('extractor_key', 'unknown').lower(),
-        'download_options': {'hd': None, 'sd': None},
-        'is_drm_protected': True,
-        'drm_message': '⚠️ هذا الفيديو محمي بـ DRM (Digital Rights Management) ولا يمكن تحميله. هذه تقنية حماية للمحتوى تمنع النسخ والتحميل غير المصرح به.',
-        'all_formats_count': 0,
-        'is_streaming': False,
-        'streaming_warning': None
-    }
-
-# --- API Endpoints ---
+# ============ API Endpoints ============
 
 @app.post("/extract", response_model=ExtractResponse)
 async def extract(request: Request, req_body: ExtractRequest):
@@ -445,46 +347,49 @@ async def extract(request: Request, req_body: ExtractRequest):
     
     url = str(req_body.url)
     
-    # الخطوة 1: التحقق من الروابط المباشرة (جميع الصيغ)
-    direct_result = is_direct_video_url(url)
-    if direct_result:
-        return ExtractResponse(
-            success=True,
-            data=VideoInfo(**direct_result)
-        )
+    # التحقق من الروابط المباشرة أولاً
+    url_lower = url.lower()
+    for ext in ALL_VIDEO_EXTENSIONS:
+        if url_lower.endswith(ext):
+            return ExtractResponse(
+                success=True,
+                data=VideoInfo(
+                    title="Direct Video",
+                    thumbnail="",
+                    duration=0,
+                    platform="direct",
+                    download_options={
+                        'hd': DownloadOption(
+                            quality="Direct",
+                            url=url,
+                            extension=ext.replace('.', ''),
+                            is_direct=True,
+                            is_streaming=False,
+                            streaming_type=None
+                        ),
+                        'sd': None
+                    },
+                    is_drm_protected=False,
+                    all_formats_count=1,
+                    extracted_url=url
+                )
+            )
     
-    # الخطوة 2: التحقق من روابط البث المباشر HLS/DASH
-    streaming_result = is_streaming_url(url)
-    if streaming_result:
-        data = handle_streaming_url(url, streaming_result)
-        return ExtractResponse(
-            success=True,
-            data=VideoInfo(**data)
-        )
-    
-    # الخطوة 3: محاولة الاستخراج باستخدام yt-dlp
+    # محاولة الاستخراج باستخدام yt-dlp
     try:
         data = extract_video_info_generic(url)
         return ExtractResponse(success=True, data=VideoInfo(**data))
     except HTTPException as e:
-        if e.detail == "DRM_PROTECTED":
-            return ExtractResponse(
-                success=False,
-                error="هذا الموقع يستخدم تقنية DRM لحماية المحتوى، التحميل غير ممكن. هذه حماية قانونية للمحتوى."
-            )
         return ExtractResponse(success=False, error=e.detail)
     except Exception as e:
         return ExtractResponse(success=False, error=str(e))
 
 @app.get("/supported-formats")
 async def supported_formats():
-    """إرجاع قائمة بجميع الصيغ المدعومة"""
     return {
         "success": True,
         "count": len(ALL_VIDEO_EXTENSIONS),
-        "formats": ALL_VIDEO_EXTENSIONS,
-        "streaming_formats": HLS_EXTENSIONS + DASH_EXTENSIONS,
-        "note": "يدعم السيرفر جميع هذه الصيغ للروابط المباشرة بالإضافة إلى آلاف المواقع عبر yt-dlp"
+        "formats": ALL_VIDEO_EXTENSIONS
     }
 
 @app.get("/health")
@@ -492,57 +397,23 @@ async def health():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "3.0.0",
-        "features": {
-            "direct_links": len(ALL_VIDEO_EXTENSIONS),
-            "streaming_support": True,
-            "drm_detection": True,
-            "rate_limit": "10 requests/minute"
-        }
+        "version": "3.1.0"
     }
 
 @app.get("/")
 async def index():
     return {
         "message": "CupGet Video Downloader API - Professional Edition",
-        "version": "3.0.0",
-        "developer": "Professional Video Downloader",
-        "supported_formats_count": len(ALL_VIDEO_EXTENSIONS),
+        "version": "3.1.0",
         "features": [
-            "✅ دعم جميع صيغ الفيديو المباشرة (MP4, MOV, MKV, AVI, WEBM, FLV, WMV, وغيرها)",
-            "✅ دعم صيغ HD و Blu-ray (M2TS, TS, VOB, M2V)",
-            "✅ دعم الصيغ المتقدمة (HEVC/H.265, VP9, AV1)",
-            "✅ دعم روابط البث المباشر HLS (.m3u8) و DASH (.mpd)",
-            "✅ دعم آلاف المواقع عبر yt-dlp (يوتيوب، فيسبوك، انستقرام، تيك توك، تويتر)",
-            "✅ دعم الروابط العامة والمواقع الإخبارية",
-            "✅ كشف الحماية DRM مع رسائل مناسبة",
-            "✅ خيارات HD و SD لكل الفيديوهات",
-            "✅ نظام حماية من الطلبات المتكررة (Rate Limiting)"
-        ],
-        "endpoints": {
-            "/extract": "POST - استخراج معلومات الفيديو وروابط التحميل",
-            "/supported-formats": "GET - عرض جميع الصيغ المدعومة",
-            "/health": "GET - التحقق من صحة السيرفر"
-        },
-        "example_request": {
-            "url": "https://example.com/video.mp4"
-        }
+            "✅ دعم جميع صيغ الفيديو المباشرة",
+            "✅ دعم آلاف المواقع عبر yt-dlp",
+            "✅ محاكاة متصفح Chrome/Firefox/Safari",
+            "✅ فك توجيه الروابط تلقائياً",
+            "✅ نظام حماية من الطلبات المتكررة"
+        ]
     }
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"""
-    ╔══════════════════════════════════════════════════════════════╗
-    ║     CupGet Video Downloader API - Professional Edition      ║
-    ║                         Version 3.0.0                        ║
-    ╠══════════════════════════════════════════════════════════════╣
-    ║  🎬 Supported Direct Formats: {len(ALL_VIDEO_EXTENSIONS)} formats      ║
-    ║  📡 Streaming Support: HLS (.m3u8) + DASH (.mpd)            ║
-    ║  🛡️ DRM Detection: Enabled                                   ║
-    ║  🌐 Platform Support: 1000+ sites via yt-dlp                ║
-    ╠══════════════════════════════════════════════════════════════╣
-    ║  🚀 Server running on: http://0.0.0.0:8000                  ║
-    ║  📖 API Docs: http://0.0.0.0:8000/docs                      ║
-    ╚══════════════════════════════════════════════════════════════╝
-    """)
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
